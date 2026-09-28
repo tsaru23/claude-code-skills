@@ -1,0 +1,5 @@
+# 開発ネタとして参照しないもの・除外した投稿の記録は push しない
+skipped.jsonl
+pending.jsonl
+*.log
+backup-*/

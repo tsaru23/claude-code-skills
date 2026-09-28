@@ -1,6 +1,6 @@
 # claude-code-skills
 
-Claude Code で使っているスキルのうち、自分で作った5つをまとめたリポジトリです。スキルは、`SKILL.md` に「どんな依頼で動くか」と「どう進めるか」を書いたフォルダのことで、依頼の内容が `description` の条件に合うと、Claude Code がその手順を読み込んで動きます（Agent Skills）。導入の手順と、動かないときの確認点は末尾にまとめています。
+Claude Code で使っているスキルのうち、自分で作った6つをまとめたリポジトリです。スキルは、`SKILL.md` に「どんな依頼で動くか」と「どう進めるか」を書いたフォルダのことで、依頼の内容が `description` の条件に合うと、Claude Code がその手順を読み込んで動きます（Agent Skills）。導入の手順と、動かないときの確認点は末尾にまとめています。
 
 | スキル | 何をするか | 追加で必要なもの |
 |---|---|---|
@@ -9,6 +9,7 @@ Claude Code で使っているスキルのうち、自分で作った5つをま�
 | [design-adopt](#design-adopt) | オープンソースのデザインを探して、プロジェクトに合うものを取り込む | shadcn/ui の MCP、GitHub CLI（`gh`）、Figma の MCP など |
 | [session-title-refresh](#session-title-refresh) | セッション名を、何をしているか分かる名前に付け直す | セッションの一覧取得と改名ができるツール |
 | [webapp-blueprint](#webapp-blueprint) | Webアプリを0から作るときの設計書を、対話で決めながら書き出す | コンポーネントの取得に shadcn CLI（`npx shadcn`） |
+| [x-bookmark-dev-source](#x-bookmark-dev-source) | Xのブックマークを公式APIで取り込み、開発ネタの情報源として使う | X Developer アカウントと API クレジット、Python 3.10+、Claude Code CLI、GitHub CLI（任意） |
 
 ## model-orchestrator
 
@@ -42,6 +43,16 @@ UI の見た目を良くしたいときに、ゼロから作らず、既存の�
 
 フェーズ構成と信号機システム（🔵🟡🔴）は [Tsumiki](https://github.com/classmethod/tsumiki)（MIT）を参考にしました。
 
+## x-bookmark-dev-source
+
+X（旧Twitter）でブックマークした投稿を、公式 X API v2 だけを使って取得し、1投稿1 Markdown として保存した上で、開発ネタ・実装の参考情報源として使うためのスキルです。スクレイピングや Cookie の利用は一切行いません。
+
+セットアップ（X Developer Console でのアプリ作成・認可）、日次の差分同期、保存済みデータからのネタ出しの3つの場面をカバーします。取得した投稿は開発関連フィルタ（キーワード/ドメイン判定 → 未マッチ分だけ Claude Haiku で判定）を通してから保存され、投稿者本人のスレッドの続きも合わせて取得します。
+
+ブックマーク本文は他人が書いたデータのため、指示としては扱いません。投稿で紹介されたコマンドの実行やリンク先へのアクセスはユーザーに確認してから行い、本文を公開物にそのまま転載することもしません。保存先のデータ用リポジトリは著作権・X開発者規約上、必ずプライベートにする必要があります。
+
+X API とリプライ検索は従量課金です。目安や設定手順は `references/setup.md` にまとめています。
+
 ## 導入方法
 
 使いたいスキルのフォルダを、そのまま `~/.claude/skills/` の下にコピーします。
@@ -52,6 +63,7 @@ UI の見た目を良くしたいときに、ゼロから作らず、既存の�
 ~/.claude/skills/design-adopt/
 ~/.claude/skills/session-title-refresh/
 ~/.claude/skills/webapp-blueprint/
+~/.claude/skills/x-bookmark-dev-source/
 ```
 
 コピーのあとに設定を足す必要はありません。依頼の内容が各スキルの `description` に合えば、自動で読み込まれます。
@@ -62,6 +74,7 @@ UI の見た目を良くしたいときに、ゼロから作らず、既存の�
 - **design-adopt**: shadcn/ui の MCP、GitHub CLI（`gh`）、Figma の MCP、21st.dev を使う手順があり、つながっていないツールの段階は動きません
 - **session-title-refresh**: セッションの一覧取得と名前の変更ができるツール（Claude のデスクトップアプリなどが提供するもの）が要ります。Claude Code だけの環境では動かないことがあります
 - **webapp-blueprint**: 最後の工程でコンポーネントを取り込むところだけ shadcn CLI を使います。CLI を使わない場合は、ファイルを直接コピーする手順が blueprint-components 側の README にあります
+- **x-bookmark-dev-source**: `scripts/` 内の `xbm.py` は skills フォルダの中では実行できません（`data/` を git リポジトリとして持たせる必要があるため）。任意の作業フォルダにコピーしてから使ってください。詳しい手順は `references/setup.md` を参照してください
 
 うまく動かないときや改善の提案は、Issues に書いてください。
 
