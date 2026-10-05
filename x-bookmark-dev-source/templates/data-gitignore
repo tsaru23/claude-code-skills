@@ -3,3 +3,6 @@ skipped.jsonl
 pending.jsonl
 *.log
 backup-*/
+
+# download-media で保存した他人の動画・画像は push しない
+media/

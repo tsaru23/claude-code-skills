@@ -1115,5 +1115,519 @@ class TestCleanReplies(BaseTestCase):
         self.assertEqual(list(self.data.glob("backup-*")), [])
 
 
+
+# ---------------------------------------------------------------------------
+# 引用ポスト・メディアダウンロード
+# ---------------------------------------------------------------------------
+
+
+def quote_tweet(tid, qid, text="引用コメント GitHub", author_id="999"):
+    t = make_tweet(tid, text=text, author_id=author_id)
+    t["referenced_tweets"] = [{"type": "quoted", "id": qid}]
+    return t
+
+
+def run_sync_with_page(test, page, **kwargs):
+    urls = []
+
+    def fake_http_request(method, url, headers=None, data=None, timeout=30):
+        urls.append(url)
+        if "/bookmarks" in url:
+            return make_response(200, page)
+        return make_response(200, {"data": [], "meta": {}})
+
+    kwargs.setdefault("no_replies", True)
+    with patch.object(xbm, "http_request", side_effect=fake_http_request), \
+         patch.object(xbm, "sleep_seconds"):
+        rc = xbm.run_sync(test.cfg, test.token, test.home, test.data, full=False, max_pages=10, **kwargs)
+    test.assertEqual(rc, 0)
+    return urls
+
+
+class TestQuotedSync(BaseTestCase):
+    def _md(self, tid):
+        return (self.data / "bookmarks" / "2026-09" / f"{tid}.md").read_text(encoding="utf-8")
+
+    def test_quoted_resolved_into_frontmatter_and_body_before_replies(self):
+        qt = make_tweet("5002", text="引用先本文 &amp; 1行目\n2行目 https://t.co/x",
+                        author_id="456", created_at="2026-08-31T00:00:00.000Z",
+                        entities={"urls": [{"url": "https://t.co/x", "expanded_url": "https://example.com/a"}]})
+        page = {"data": [quote_tweet("5001", "5002")], "includes": {"tweets": [qt]}, "meta": {}}
+        urls = run_sync_with_page(self, page)
+        self.assertIn("referenced_tweets.id.attachments.media_keys", urllib.parse.unquote(urls[0]))
+        content = self._md("5001")
+        self.assertIn('quoted:\n  id: "5002"\n  url: https://x.com/i/status/5002', content)
+        self.assertIn('  author_id: "456"', content)
+        self.assertIn("  created_at: 2026-08-31T00:00:00.000Z", content)
+        self.assertIn('  text: "引用先本文 & 1行目\\n2行目 https://example.com/a"', content)
+        self.assertIn("  media: []", content)
+        self.assertIn(
+            "\n\n## 引用元の投稿\nhttps://x.com/i/status/5002\n\n> 引用先本文 & 1行目\n> 2行目 https://example.com/a",
+            content,
+        )
+
+        # リプライ節より前に入ること
+        tweet = quote_tweet("5003", "5002")
+        xbm.save_tweet(self.data, tweet, "x", filter_label="x", replies_list=[
+            {"id": "5004", "author_id": "999", "created_at": "2026-09-01T13:00:00.000Z", "text": "続報"}],
+            quoted={"id": "5002", "text": "q", "media": []})
+        c3 = self._md("5003")
+        self.assertLess(c3.index("## 引用元の投稿"), c3.index("## 投稿者のリプライ"))
+
+    def test_quoted_video_selects_max_bitrate_mp4(self):
+        qt = make_tweet("5102", text="動画つき", author_id="456")
+        qt["attachments"] = {"media_keys": ["qm1"]}
+        page = {
+            "data": [quote_tweet("5101", "5102")],
+            "includes": {
+                "tweets": [qt],
+                "media": [{
+                    "media_key": "qm1", "type": "video", "duration_ms": 1234,
+                    "preview_image_url": "https://pbs.twimg.com/p.jpg",
+                    "variants": [
+                        {"content_type": "video/mp4", "bit_rate": 100, "url": "https://video.twimg.com/low.mp4"},
+                        {"content_type": "video/mp4", "bit_rate": 900, "url": "https://video.twimg.com/high.mp4"},
+                        {"content_type": "application/x-mpegURL", "url": "https://video.twimg.com/x.m3u8"},
+                    ],
+                }],
+            },
+            "meta": {},
+        }
+        run_sync_with_page(self, page)
+        content = self._md("5101")
+        self.assertIn('  media:\n    - type: "video"', content)
+        self.assertIn('      video_url: "https://video.twimg.com/high.mp4"', content)
+        self.assertNotIn("low.mp4", content)
+
+    def test_no_quote_has_no_quoted_and_unavailable_quote(self):
+        page = {"data": [make_tweet("5201", text="GitHub plain"), quote_tweet("5202", "5299")],
+                "includes": {"tweets": []}, "meta": {}}
+        run_sync_with_page(self, page)
+        plain = self._md("5201")
+        self.assertNotIn("quoted:", plain)
+        self.assertNotIn("引用元の投稿", plain)
+        un = self._md("5202")
+        self.assertIn('quoted:\n  id: "5299"\n  url: https://x.com/i/status/5299\n  unavailable: true', un)
+        self.assertNotIn("  text:", un)
+        self.assertIn("## 引用元の投稿\nhttps://x.com/i/status/5299", un)
+
+    def test_keyword_only_in_quoted_text_is_saved(self):
+        qt = make_tweet("5302", text="Claude Code の使い方", author_id="456")
+        t = quote_tweet("5301", "5302", text="これ見て")
+        page = {"data": [t], "includes": {"tweets": [qt]}, "meta": {}}
+        with patch.object(xbm, "run_claude", side_effect=AssertionError("claude must not be called")):
+            run_sync_with_page(self, page)
+        content = self._md("5301")
+        self.assertIn('filter: "keyword:Claude"', content)
+
+    def test_no_quoted_flag_omits_referenced_tweets_expansions(self):
+        qt = make_tweet("5402", text="q")
+        page = {"data": [quote_tweet("5401", "5402")], "includes": {"tweets": [qt]}, "meta": {}}
+        urls = run_sync_with_page(self, page, no_quoted=True)
+        self.assertNotIn("referenced_tweets", urllib.parse.unquote(urls[0]))
+        self.assertNotIn("quoted:", self._md("5401"))
+
+    def test_cost_logged_for_quoted(self):
+        qt = make_tweet("5502", text="q")
+        page = {"data": [quote_tweet("5501", "5502")], "includes": {"tweets": [qt]}, "meta": {}}
+        run_sync_with_page(self, page)
+        log = (self.data / "usage.log").read_text(encoding="utf-8")
+        self.assertIn("quoted=1", log)
+        self.assertIn("quoted_cost_usd=0.005", log)
+
+    def test_invalid_quoted_id_is_not_saved(self):
+        page = {"data": [quote_tweet("5601", "abc/../x")], "includes": {}, "meta": {}}
+        run_sync_with_page(self, page)
+        self.assertNotIn("quoted:", self._md("5601"))
+
+    def test_pending_retains_quoted_and_is_applied_on_retry(self):
+        qt = make_tweet("5702", text="引用先の本文", author_id="456")
+        t = quote_tweet("5701", "5702", text="雑談です")
+        page = {"data": [t], "includes": {"tweets": [qt]}, "meta": {}}
+        with patch.object(xbm, "run_claude", side_effect=RuntimeError("boom")):
+            run_sync_with_page(self, page)
+        pending = xbm.load_pending_tweets(self.data)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["_quoted"]["id"], "5702")
+        self.assertEqual(pending[0]["_quoted"]["text"], "引用先の本文")
+
+        seen = {}
+
+        def fake_claude(prompt, model="haiku"):
+            seen["prompt"] = prompt
+            return json.dumps(["5701"])
+
+        def fake_http(method, url, headers=None, data=None, timeout=30):
+            return make_response(200, {"data": [], "meta": {}})
+
+        with patch.object(xbm, "run_claude", side_effect=fake_claude), \
+             patch.object(xbm, "http_request", side_effect=fake_http), \
+             patch.object(xbm, "sleep_seconds"):
+            xbm.run_sync(self.cfg, self.token, self.home, self.data, no_replies=True)
+        self.assertIn("引用先の本文", seen["prompt"])
+        content = self._md("5701")
+        self.assertIn('quoted:\n  id: "5702"', content)
+        self.assertIn("> 引用先の本文", content)
+
+
+class TestQuotedBackfill(BaseTestCase):
+    def _save(self, tid, links, replies=None):
+        t = make_tweet(tid, text="GitHub post")
+        t["entities"] = {"urls": [{"url": f"https://t.co/{tid}", "expanded_url": u} for u in links]}
+        xbm.save_tweet(self.data, t, "x", filter_label="keyword:GitHub", replies_list=replies, media=[])
+        return self.data / "bookmarks" / "2026-09" / f"{tid}.md"
+
+    def _seed(self):
+        a = self._save("6001", ["https://x.com/someone/status/6101"],
+                       replies=[{"id": "6002", "author_id": "999", "created_at": "2026-09-01T13:00:00.000Z", "text": "続報"}])
+        b = self._save("6003", ["https://x.com/someone/status/6103"])
+        self._save("6005", ["https://x.com/me/status/6005/photo/1"])  # 自己リンクのみ
+        self._save("6006", ["https://example.com/a"])
+        return a, b
+
+    def test_candidates_only_missing_quoted_with_foreign_status_link(self):
+        self._seed()
+        ids = sorted(c["id"] for c in xbm.find_quoted_candidates(self.data))
+        self.assertEqual(ids, ["6001", "6003"])
+        # quoted: null が付いたら再対象化されない
+        xbm.backfill_quoted_into_file(self.data / "bookmarks" / "2026-09" / "6003.md", None)
+        ids = sorted(c["id"] for c in xbm.find_quoted_candidates(self.data))
+        self.assertEqual(ids, ["6001"])
+
+    def test_non_interactive_without_yes_does_not_run(self):
+        self._seed()
+        with patch.object(xbm, "http_request", side_effect=AssertionError("no http")), \
+             patch.object(xbm, "stdin_is_tty", return_value=False):
+            rc = xbm.run_quoted_backfill(self.cfg, self.token, self.home, self.data, yes=False)
+        self.assertEqual(rc, 1)
+        self.assertNotIn("quoted:", (self.data / "bookmarks" / "2026-09" / "6001.md").read_text(encoding="utf-8"))
+
+    def test_interactive_decline_does_not_run(self):
+        self._seed()
+        with patch.object(xbm, "http_request", side_effect=AssertionError("no http")), \
+             patch.object(xbm, "stdin_is_tty", return_value=True), \
+             patch.object(xbm, "confirm_prompt", return_value=False):
+            rc = xbm.run_quoted_backfill(self.cfg, self.token, self.home, self.data, yes=False)
+        self.assertEqual(rc, 0)
+
+    def test_backfill_writes_quoted_and_null_and_logs_cost(self):
+        a, b = self._seed()
+        t1 = quote_tweet("6001", "6101")
+        t3 = make_tweet("6003")  # 引用ではない
+        qt = make_tweet("6101", text="引用先 本文", author_id="456")
+        payload = {"data": [t1, t3], "includes": {"tweets": [qt]}}
+        urls = []
+
+        def fake_http(method, url, headers=None, data=None, timeout=30):
+            urls.append(url)
+            return make_response(200, payload)
+
+        with patch.object(xbm, "http_request", side_effect=fake_http):
+            rc = xbm.run_quoted_backfill(self.cfg, self.token, self.home, self.data, yes=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(urls), 1)
+        u = urllib.parse.unquote(urls[0])
+        self.assertIn("/2/tweets?ids=", u)
+        self.assertIn("6001", u)
+        self.assertIn("6003", u)
+        self.assertIn("referenced_tweets.id.attachments.media_keys", u)
+
+        ca = a.read_text(encoding="utf-8")
+        self.assertIn('quoted:\n  id: "6101"', ca)
+        self.assertIn('  text: "引用先 本文"', ca)
+        # 本文節はリプライ節より前
+        self.assertLess(ca.index("## 引用元の投稿"), ca.index("## 投稿者のリプライ"))
+        self.assertIn("> 引用先 本文", ca)
+        self.assertIn("quoted: null", b.read_text(encoding="utf-8"))
+        self.assertNotIn("引用元の投稿", b.read_text(encoding="utf-8"))
+
+        log = (self.data / "usage.log").read_text(encoding="utf-8")
+        self.assertIn("quoted=1", log)
+        self.assertIn("cost_usd=0.015", log)  # 投稿2件 + 引用先1件
+
+        # 書き換え後も frontmatter が壊れていない
+        self.assertEqual(xbm.find_quoted_candidates(self.data), [])
+
+    def test_api_failure_writes_nothing(self):
+        a, b = self._seed()
+        before = (a.read_text(encoding="utf-8"), b.read_text(encoding="utf-8"))
+        with patch.object(xbm, "http_request", return_value=make_response(500, {"error": "x"})):
+            rc = xbm.run_quoted_backfill(self.cfg, self.token, self.home, self.data, yes=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual((a.read_text(encoding="utf-8"), b.read_text(encoding="utf-8")), before)
+
+    def test_limit_applies(self):
+        self._seed()
+        with patch.object(xbm, "http_request", return_value=make_response(200, {"data": []})) as m:
+            xbm.run_quoted_backfill(self.cfg, self.token, self.home, self.data, yes=True, limit=1)
+        ids_param = urllib.parse.unquote(m.call_args[0][1]).split("ids=")[1].split("&")[0]
+        self.assertEqual(len(ids_param.split(",")), 1)
+
+
+class _FakeResponse:
+    def __init__(self, data, length=None):
+        self._data = data
+        self._pos = 0
+        self.headers = {"Content-Length": str(length)} if length is not None else {}
+
+    def read(self, n=-1):
+        chunk = self._data[self._pos:self._pos + n]
+        self._pos += len(chunk)
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class TestDownloadMedia(BaseTestCase):
+    def _seed(self):
+        t = make_tweet("7001", text="GitHub video")
+        media = [
+            {"type": "video", "preview": "https://pbs.twimg.com/p.jpg", "duration_ms": 10,
+             "video_url": "https://video.twimg.com/a/b.mp4?tag=12"},
+            {"type": "photo", "url": "https://pbs.twimg.com/media/x.png"},
+            {"type": "video", "preview": "https://pbs.twimg.com/p2.jpg"},  # video_url 無し -> 対象外
+        ]
+        quoted = {"id": "7002", "text": "q", "author_id": "456", "created_at": "2026-08-01T00:00:00.000Z",
+                  "media": [{"type": "video", "video_url": "https://video.twimg.com/q.mp4"},
+                            {"type": "photo", "url": "https://evil.example.com/x.jpg"}]}
+        xbm.save_tweet(self.data, t, "x", filter_label="x", media=media, quoted=quoted)
+
+    def test_parse_fm_media_roundtrip(self):
+        self._seed()
+        text = (self.data / "bookmarks" / "2026-09" / "7001.md").read_text(encoding="utf-8")
+        parsed = xbm.parse_fm_media(xbm._FRONTMATTER_RE.match(text).group(1))
+        self.assertEqual(len(parsed["media"]), 3)
+        self.assertEqual(parsed["media"][0]["video_url"], "https://video.twimg.com/a/b.mp4?tag=12")
+        self.assertEqual(parsed["media"][0]["duration_ms"], 10)
+        self.assertEqual(len(parsed["quoted"]), 2)
+        self.assertEqual(parsed["quoted"][0]["video_url"], "https://video.twimg.com/q.mp4")
+
+    def test_download_paths_host_rejection_and_existing_skip(self):
+        self._seed()
+        calls = []
+
+        def fake_open(url, timeout=30):
+            calls.append(url)
+            return _FakeResponse(b"DATA", length=4)
+
+        with patch.object(xbm, "open_stream", side_effect=fake_open):
+            rc = xbm.run_download_media(self.data, ["7001"])
+        media = self.data / "media"
+        self.assertEqual(rc, 1)  # evil ホストは拒否（失敗扱い）
+        self.assertEqual(sorted(p.name for p in media.iterdir()), ["7001-1.mp4", "7001-2.png", "7001-q-1.mp4"])
+        self.assertNotIn("https://evil.example.com/x.jpg", calls)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual((media / "7001-1.mp4").read_bytes(), b"DATA")
+
+        # 2回目は既存をスキップ（ダウンロードしない）
+        with patch.object(xbm, "open_stream", side_effect=AssertionError("no download")):
+            xbm.run_download_media(self.data, ["7001"])
+
+    def test_missing_tweet_and_invalid_id(self):
+        rc = xbm.run_download_media(self.data, ["9999", "../x"])
+        self.assertEqual(rc, 1)
+
+    def test_allowed_url_check(self):
+        self.assertTrue(xbm.is_allowed_download_url("https://video.twimg.com/a.mp4"))
+        self.assertTrue(xbm.is_allowed_download_url("https://pbs.twimg.com/a.jpg"))
+        self.assertFalse(xbm.is_allowed_download_url("https://twimg.com/a.jpg"))
+        self.assertFalse(xbm.is_allowed_download_url("https://video.twimg.com.evil.com/a.mp4"))
+        self.assertFalse(xbm.is_allowed_download_url("http://video.twimg.com/a.mp4"))
+
+    def test_size_limit_by_content_length_and_streaming_removes_partial(self):
+        dest = self.tmp / "media" / "x.mp4"
+        with patch.object(xbm, "open_stream", return_value=_FakeResponse(b"x", length=1000)):
+            with self.assertRaises(ValueError):
+                xbm.download_file("https://video.twimg.com/x.mp4", dest, max_bytes=100)
+        self.assertFalse(dest.exists())
+        self.assertEqual(list(dest.parent.glob("*")), [])
+
+        # Content-Length 無し・読み込み中に超過 -> 部分ファイルを削除
+        with patch.object(xbm, "open_stream", return_value=_FakeResponse(b"y" * 500)), \
+             patch.object(xbm, "DOWNLOAD_CHUNK_BYTES", 50):
+            with self.assertRaises(ValueError):
+                xbm.download_file("https://video.twimg.com/x.mp4", dest, max_bytes=100)
+        self.assertFalse(dest.exists())
+        self.assertEqual(list(dest.parent.glob("*")), [])
+
+
+
+# ---------------------------------------------------------------------------
+# X 記事（Article）対応 / enrich
+# ---------------------------------------------------------------------------
+
+
+def article_tweet(tid, title="記事タイトル", plain="記事の本文です。\n2段落目。", preview="プレビュー",
+                  text=None, author_id="456"):
+    t = make_tweet(tid, text=text or "http://x.com/i/article/" + tid, author_id=author_id)
+    art = {}
+    if title is not None:
+        art["title"] = title
+    if plain is not None:
+        art["plain_text"] = plain
+    if preview is not None:
+        art["preview_text"] = preview
+    t["article"] = art
+    return t
+
+
+class TestArticle(BaseTestCase):
+    def _md(self, tid):
+        return (self.data / "bookmarks" / "2026-09" / f"{tid}.md").read_text(encoding="utf-8")
+
+    def test_own_article_saved_in_frontmatter_and_body(self):
+        page = {"data": [article_tweet("8301", text="GitHub http://x.com/i/article/8301")], "meta": {}}
+        urls = run_sync_with_page(self, page)
+        self.assertIn("article", urllib.parse.parse_qs(urllib.parse.urlparse(urls[0]).query)["tweet.fields"][0].split(","))
+        c = self._md("8301")
+        self.assertIn('article:\n  title: "記事タイトル"\n  preview_text: "プレビュー"', c)
+        self.assertIn("\n\n## 記事本文\n\n### 記事タイトル\n\n記事の本文です。\n2段落目。", c)
+
+    def test_title_only_article_is_saved(self):
+        page = {"data": [article_tweet("8302", plain=None, preview=None, text="GitHub x")], "meta": {}}
+        run_sync_with_page(self, page)
+        c = self._md("8302")
+        self.assertIn('article:\n  title: "記事タイトル"', c)
+        self.assertIn("## 記事本文\n\n### 記事タイトル", c)
+
+    def test_quoted_article_in_frontmatter_and_quote_section(self):
+        qt = article_tweet("8402")
+        page = {"data": [quote_tweet("8401", "8402")], "includes": {"tweets": [qt]}, "meta": {}}
+        run_sync_with_page(self, page)
+        c = self._md("8401")
+        self.assertIn('  article:\n    title: "記事タイトル"\n    preview_text: "プレビュー"', c)
+        self.assertIn("> http://x.com/i/article/8402\n\n### 記事: 記事タイトル\n\n記事の本文です。", c)
+        # 記事は plain_text も含めて pending 用 _quoted に保持される形で解決されている
+        q = xbm.resolve_quoted(quote_tweet("8401", "8402"), {"8402": qt}, {})
+        self.assertEqual(q["article"]["plain_text"], "記事の本文です。\n2段落目。")
+
+    def test_keyword_only_in_article_body_passes_filter(self):
+        t = article_tweet("8501", title="日記", plain="今日は Claude Code を使った", preview=None,
+                          text="これ読んで")
+        page = {"data": [t], "meta": {}}
+        with patch.object(xbm, "run_claude", side_effect=AssertionError("no claude")):
+            run_sync_with_page(self, page)
+        self.assertIn('filter: "keyword:Claude"', self._md("8501"))
+
+    def test_keyword_only_in_quoted_article_passes_filter(self):
+        qt = article_tweet("8602", title="日記", plain="Python の話", preview=None)
+        page = {"data": [quote_tweet("8601", "8602", text="これ")], "includes": {"tweets": [qt]}, "meta": {}}
+        with patch.object(xbm, "run_claude", side_effect=AssertionError("no claude")):
+            run_sync_with_page(self, page)
+        self.assertIn('filter: "keyword:Python"', self._md("8601"))
+
+    def test_claude_prompt_truncates_article_plain_text(self):
+        t = article_tweet("8701", plain="あ" * 5000)
+        prompt = xbm.build_claude_prompt([t])
+        self.assertIn("あ" * 2000, prompt)
+        self.assertNotIn("あ" * 2001, prompt)
+
+
+class TestEnrich(BaseTestCase):
+    def _old_md(self, tid, text="GitHub post", extra_fm="", body_extra=""):
+        d = self.data / "bookmarks" / "2026-09"
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / f"{tid}.md"
+        p.write_text(
+            f'---\nid: "{tid}"\nurl: https://x.com/i/status/{tid}\nauthor_id: "999"\n'
+            f'created_at: 2026-09-01T12:00:00.000Z\nconversation_id: "{tid}"\nlang: ja\n'
+            f'filter: "keyword:GitHub"\nreplies: 0\nfetched_at: x\nlinks: []\n{extra_fm}---\n\n{text}{body_extra}\n',
+            encoding="utf-8")
+        return p
+
+    def _run(self, payload, **kw):
+        urls = []
+
+        def fake_http(method, url, headers=None, data=None, timeout=30):
+            urls.append(url)
+            return make_response(200, payload)
+
+        with patch.object(xbm, "http_request", side_effect=fake_http):
+            rc = xbm.run_enrich_backfill(self.cfg, self.token, self.home, self.data, yes=True, **kw)
+        self.assertEqual(rc, 0)
+        return urls
+
+    def test_enrich_adds_media_article_and_quoted_then_is_idempotent(self):
+        p1 = self._old_md("9001")  # media 無し
+        p2 = self._old_md("9002", text="記事 http://x.com/i/article/9002", extra_fm="media: []\nquoted: null\n")
+        p3 = self._old_md("9003", extra_fm="media: []\nquoted: null\n")  # 対象外
+        p4 = self._old_md(
+            "9004", text="引用", extra_fm=(
+                'media: []\nquoted:\n  id: "9104"\n  url: https://x.com/i/status/9104\n'
+                '  author_id: "456"\n  text: "http://x.com/i/article/9104"\n  media: []\n'),
+            body_extra="\n\n## 引用元の投稿\nhttps://x.com/i/status/9104\n\n> http://x.com/i/article/9104"
+                       "\n## 投稿者のリプライ\n\n### 2026-09-01T13:00:00.000Z\nhttps://x.com/i/status/9199\n\nrep")
+        self.assertEqual(sorted(c["id"] for c in xbm.find_enrich_candidates(self.data)), ["9001", "9002", "9004"])
+
+        t1 = quote_tweet("9001", "9101", text="GitHub post")
+        t1["attachments"] = {"media_keys": ["m1"]}
+        t2 = article_tweet("9002", text="記事 http://x.com/i/article/9002")
+        t4 = quote_tweet("9004", "9104", text="引用")
+        payload = {
+            "data": [t1, t2, t4],
+            "includes": {
+                "tweets": [make_tweet("9101", text="引用先 本文", author_id="456"), article_tweet("9104")],
+                "media": [{"media_key": "m1", "type": "photo", "url": "https://pbs.twimg.com/a.jpg"}],
+            },
+        }
+        urls = self._run(payload)
+        u = urllib.parse.unquote(urls[0])
+        self.assertIn("attachments.media_keys,referenced_tweets.id", u)
+        self.assertIn("article", u.split("tweet.fields=")[1].split("&")[0].split(","))
+
+        c1 = p1.read_text(encoding="utf-8")
+        self.assertIn('media:\n  - type: "photo"\n    url: "https://pbs.twimg.com/a.jpg"', c1)
+        self.assertIn('quoted:\n  id: "9101"', c1)
+        self.assertIn("> 引用先 本文", c1)
+
+        c2 = p2.read_text(encoding="utf-8")
+        self.assertIn('article:\n  title: "記事タイトル"', c2)
+        self.assertIn("## 記事本文\n\n### 記事タイトル\n\n記事の本文です。", c2)
+
+        c4 = p4.read_text(encoding="utf-8")
+        self.assertIn('  article:\n    title: "記事タイトル"', c4)
+        self.assertLess(c4.index("### 記事: 記事タイトル"), c4.index("## 投稿者のリプライ"))
+        self.assertGreater(c4.index("### 記事: 記事タイトル"), c4.index("> http://x.com/i/article/9104"))
+        self.assertEqual(c4.count('quoted:'), 1)  # 既存 quoted は書き換えない
+        self.assertEqual(p3.read_text(encoding="utf-8").count("quoted"), 1)
+
+        # 冪等: 2回目は対象0件
+        self.assertEqual(xbm.find_enrich_candidates(self.data), [])
+        with patch.object(xbm, "http_request", side_effect=AssertionError("no http")):
+            self.assertEqual(xbm.run_enrich_backfill(self.cfg, self.token, self.home, self.data, yes=True), 0)
+
+        log = (self.data / "usage.log").read_text(encoding="utf-8")
+        self.assertIn("quoted=2", log)
+
+    def test_non_article_link_gets_article_null_and_not_retargeted(self):
+        self._old_md("9201", text="x http://x.com/i/article/1", extra_fm="media: []\nquoted: null\n")
+        self._run({"data": [make_tweet("9201")]})
+        c = (self.data / "bookmarks" / "2026-09" / "9201.md").read_text(encoding="utf-8")
+        self.assertIn("article: null", c)
+        self.assertEqual(xbm.find_enrich_candidates(self.data), [])
+
+    def test_failure_writes_nothing_and_non_interactive_needs_yes(self):
+        p = self._old_md("9301")
+        before = p.read_text(encoding="utf-8")
+        with patch.object(xbm, "http_request", return_value=make_response(500, {})):
+            self.assertEqual(xbm.run_enrich_backfill(self.cfg, self.token, self.home, self.data, yes=True), 0)
+        self.assertEqual(p.read_text(encoding="utf-8"), before)
+        with patch.object(xbm, "http_request", side_effect=AssertionError("no http")), \
+             patch.object(xbm, "stdin_is_tty", return_value=False):
+            self.assertEqual(xbm.run_enrich_backfill(self.cfg, self.token, self.home, self.data, yes=False), 1)
+        self.assertEqual(p.read_text(encoding="utf-8"), before)
+
+    def test_429_stops_run(self):
+        p = self._old_md("9401")
+        before = p.read_text(encoding="utf-8")
+        with patch.object(xbm, "http_request", return_value=make_response(429, {})):
+            xbm.run_enrich_backfill(self.cfg, self.token, self.home, self.data, yes=True)
+        self.assertEqual(p.read_text(encoding="utf-8"), before)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -36,7 +36,7 @@ AUTHORIZE_URL = "https://x.com/i/oauth2/authorize"
 TOKEN_URL = "https://api.x.com/2/oauth2/token"
 USERS_ME_URL = "https://api.x.com/2/users/me"
 BOOKMARKS_URL_TMPL = "https://api.x.com/2/users/{id}/bookmarks"
-TWEET_FIELDS = "created_at,author_id,entities,note_tweet,lang,conversation_id"
+TWEET_FIELDS = "created_at,author_id,entities,note_tweet,lang,conversation_id,article"
 SCOPE = "tweet.read users.read bookmark.read offline.access"
 DEFAULT_REDIRECT_URI = "http://127.0.0.1:8765/callback"
 COST_PER_TWEET_USD = 0.001
@@ -106,6 +106,29 @@ DEFAULT_REPLIES_CONFIG = {
 
 MEDIA_EXPANSIONS = "attachments.media_keys"
 MEDIA_FIELDS = "type,preview_image_url,url,duration_ms,variants"
+
+# ---------------------------------------------------------------------------
+# 引用ポスト（quoted）とメディアのダウンロード
+# ---------------------------------------------------------------------------
+
+QUOTED_EXPANSIONS = "referenced_tweets.id,referenced_tweets.id.attachments.media_keys"
+QUOTED_TWEET_FIELD = "referenced_tweets"
+LOOKUP_TWEETS_URL = "https://api.x.com/2/tweets"
+LOOKUP_MAX_IDS = 100
+# 引用先（includes.tweets）が課金対象かは公式に未確認。安全側に見て
+# 他人の投稿の読み取り単価で見積もる。
+COST_PER_QUOTED_USD = 0.005
+COST_PER_POST_READ_USD = 0.005
+QUOTED_SECTION_HEADING = "## 引用元の投稿"
+ARTICLE_SECTION_HEADING = "## 記事本文"
+ARTICLE_URL_MARKER = "x.com/i/article/"
+ARTICLE_PROMPT_PLAIN_LIMIT = 2000
+
+DEFAULT_QUOTED_CONFIG = {"enabled": True}
+
+ALLOWED_DOWNLOAD_HOSTS = {"video.twimg.com", "pbs.twimg.com"}
+MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024
+DOWNLOAD_CHUNK_BYTES = 256 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +213,15 @@ def get_replies_config(cfg):
     for key in ("enabled", "max_posts_per_run"):
         if key in user_conf:
             conf[key] = user_conf[key]
+    return conf
+
+
+def get_quoted_config(cfg):
+    """config.json の `quoted` セクションを既定値とマージして返す。"""
+    conf = dict(DEFAULT_QUOTED_CONFIG)
+    user_conf = (cfg or {}).get("quoted") or {}
+    if "enabled" in user_conf:
+        conf["enabled"] = user_conf["enabled"]
     return conf
 
 
@@ -372,8 +404,8 @@ def build_media_list(tweet, media_by_key):
     return out
 
 
-def _render_media_lines(media):
-    lines = ["media:"]
+def _render_media_lines(media, indent=""):
+    lines = [f"{indent}media:"]
     key_order = ["type", "preview", "duration_ms", "video_url", "url"]
     for m in media:
         first = True
@@ -382,10 +414,109 @@ def _render_media_lines(media):
                 continue
             v = m[k]
             v_str = yaml_dquote(v) if isinstance(v, str) else str(v)
-            prefix = "  - " if first else "    "
+            prefix = f"{indent}  - " if first else f"{indent}    "
             lines.append(f"{prefix}{k}: {v_str}")
             first = False
     return lines
+
+
+def extract_article(tweet):
+    """tweet.article（X 記事）から title / preview_text / plain_text を取り出す。無ければ None。"""
+    a = (tweet or {}).get("article")
+    if not isinstance(a, dict):
+        return None
+    out = {
+        "title": a.get("title") or "",
+        "preview_text": a.get("preview_text") or "",
+        "plain_text": a.get("plain_text") or "",
+    }
+    if not (out["title"] or out["preview_text"] or out["plain_text"]):
+        return None
+    return out
+
+
+def article_text(article, limit=None):
+    """開発フィルタ用: 記事の title + plain_text（limit があれば plain_text を先頭 limit 文字まで）。"""
+    if not article:
+        return ""
+    plain = article.get("plain_text") or ""
+    if limit is not None:
+        plain = plain[:limit]
+    return "\n".join(x for x in (article.get("title") or "", plain) if x)
+
+
+def _render_article_lines(article, indent=""):
+    lines = [f"{indent}article:", f"{indent}  title: {yaml_dquote(article.get('title', ''))}"]
+    if article.get("preview_text"):
+        lines.append(f"{indent}  preview_text: {yaml_dquote(article['preview_text'])}")
+    return lines
+
+
+def format_article_section(article):
+    """投稿自身が記事のときの本文節（引用節・リプライ節より前）。先頭は空行から始まる。"""
+    parts = ["", "", ARTICLE_SECTION_HEADING, "", f"### {article.get('title') or '(無題)'}"]
+    if article.get("plain_text"):
+        parts.extend(["", article["plain_text"]])
+    return "\n".join(parts)
+
+
+def format_quoted_article(article):
+    """引用元が記事のときの、引用ブロックの後ろに付ける節。先頭は空行から始まる。"""
+    parts = ["", "", f"### 記事: {article.get('title') or '(無題)'}"]
+    if article.get("plain_text"):
+        parts.extend(["", article["plain_text"]])
+    return "\n".join(parts)
+
+
+def valid_quoted(quoted):
+    """引用先情報として保存してよいか検証する。不正なら None を返す。"""
+    if not isinstance(quoted, dict):
+        return None
+    if not is_valid_tweet_id(quoted.get("id")):
+        return None
+    return quoted
+
+
+def _render_quoted_lines(quoted):
+    qid = str(quoted.get("id"))
+    lines = ["quoted:", f"  id: {yaml_dquote(qid)}", f"  url: https://x.com/i/status/{qid}"]
+    if quoted.get("unavailable"):
+        lines.append("  unavailable: true")
+        return lines
+    qa = quoted.get("author_id")
+    if qa is not None and is_valid_tweet_id(qa):
+        lines.append(f"  author_id: {yaml_dquote(str(qa))}")
+    if quoted.get("created_at"):
+        lines.append(f"  created_at: {quoted['created_at']}")
+    lines.append(f"  text: {yaml_dquote(quoted.get('text', ''))}")
+    qmedia = quoted.get("media")
+    if qmedia is not None:
+        if qmedia:
+            lines.extend(_render_media_lines(qmedia, indent="  "))
+        else:
+            lines.append("  media: []")
+    qarticle = quoted.get("article")
+    if qarticle:
+        lines.extend(_render_article_lines(qarticle, indent="  "))
+    return lines
+
+
+def format_quoted_section(quoted):
+    """本文末尾（リプライ節より前）に付ける「引用元の投稿」節。先頭は空行から始まる。"""
+    quoted = valid_quoted(quoted)
+    if not quoted:
+        return ""
+    qid = str(quoted["id"])
+    parts = ["", "", QUOTED_SECTION_HEADING, f"https://x.com/i/status/{qid}"]
+    if not quoted.get("unavailable"):
+        parts.append("")
+        text = quoted.get("text", "") or ""
+        for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            parts.append(("> " + line) if line else ">")
+    out = "\n".join(parts)
+    if not quoted.get("unavailable") and quoted.get("article"):
+        out += format_quoted_article(quoted["article"])
+    return out
 
 
 def format_replies_section(replies):
@@ -407,7 +538,7 @@ def format_replies_section(replies):
 
 
 def format_frontmatter(tweet, body, links, fetched_at, filter_label=None,
-                        replies_count=None, media=None):
+                        replies_count=None, media=None, quoted=None, article=None):
     tid = str(tweet.get("id", ""))
     author_id = str(tweet.get("author_id", ""))
     created_at = tweet.get("created_at", "")
@@ -437,6 +568,11 @@ def format_frontmatter(tweet, body, links, fetched_at, filter_label=None,
             lines.extend(_render_media_lines(media))
         else:
             lines.append("media: []")
+    if article:
+        lines.extend(_render_article_lines(article))
+    quoted = valid_quoted(quoted)
+    if quoted:
+        lines.extend(_render_quoted_lines(quoted))
     lines.append("---")
     lines.append("")
     lines.append(body)
@@ -458,7 +594,8 @@ def month_from_created_at(created_at):
 # ---------------------------------------------------------------------------
 
 
-def save_tweet(data_dir, tweet, fetched_at, filter_label=None, replies_list=None, media=None):
+def save_tweet(data_dir, tweet, fetched_at, filter_label=None, replies_list=None, media=None,
+               quoted=None):
     """投稿を Markdown として保存する。
 
     replies_list: None なら「今回リプライは取得していない」＝frontmatterに
@@ -474,6 +611,16 @@ def save_tweet(data_dir, tweet, fetched_at, filter_label=None, replies_list=None
 
     body, links = build_body_and_links(tweet)
     text_preview = body[:100]
+
+    if quoted is not None and not valid_quoted(quoted):
+        bad = quoted.get("id") if isinstance(quoted, dict) else quoted
+        print(f"警告: 不正な引用先ID '{bad}' のため引用情報は保存しません。")
+        quoted = None
+    article = extract_article(tweet)
+    if article:
+        body = body + format_article_section(article)
+    if quoted:
+        body = body + format_quoted_section(quoted)
 
     if replies_list is not None:
         valid_replies = []
@@ -502,6 +649,7 @@ def save_tweet(data_dir, tweet, fetched_at, filter_label=None, replies_list=None
     md = format_frontmatter(
         tweet, body, links, fetched_at,
         filter_label=filter_label, replies_count=replies_count, media=media,
+        quoted=quoted, article=article,
     )
 
     month = month_from_created_at(tweet.get("created_at", ""))
@@ -560,17 +708,19 @@ def append_index(data_dir, record):
 
 
 def append_usage_log(data_dir, fetched, new, cost_usd, skipped=0, pending=0,
-                      reply_count=0, reply_cost_usd=0.0):
+                      reply_count=0, reply_cost_usd=0.0, quoted_count=0, quoted_cost_usd=0.0):
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     log_path = data_dir / "usage.log"
     ts = datetime.now().astimezone().isoformat(timespec="seconds")
-    total_cost = cost_usd + reply_cost_usd
+    total_cost = cost_usd + reply_cost_usd + quoted_cost_usd
     with log_path.open("a", encoding="utf-8") as f:
         f.write(
             f"{ts}\tfetched={fetched}\tnew={new}\tskipped={skipped}\t"
             f"pending={pending}\treplies={reply_count}\t"
-            f"reply_cost_usd={reply_cost_usd:.3f}\tcost_usd={total_cost:.3f}\n"
+            f"reply_cost_usd={reply_cost_usd:.3f}\t"
+            f"quoted={quoted_count}\tquoted_cost_usd={quoted_cost_usd:.3f}\t"
+            f"cost_usd={total_cost:.3f}\n"
         )
 
 
@@ -845,14 +995,34 @@ def parse_claude_id_list(text):
     return [str(x) for x in data]
 
 
+def quoted_filter_parts(tweet, plain_limit=None):
+    """開発フィルタの判定対象に加える、引用先の本文（記事なら title+plain_text 込み）とリンクを返す。"""
+    q = tweet.get("_quoted")
+    if not isinstance(q, dict) or q.get("unavailable"):
+        return "", []
+    text = q.get("text") or ""
+    atext = article_text(q.get("article"), plain_limit)
+    if atext:
+        text = text + "\n" + atext
+    return text, list(q.get("links") or [])
+
+
 def build_claude_prompt(tweets):
     items = []
     for t in tweets:
         body, links = build_body_and_links(t)
-        items.append({"id": str(t.get("id")), "text": body, "links": links})
+        item = {"id": str(t.get("id")), "text": body, "links": links}
+        qtext, _qlinks = quoted_filter_parts(t, ARTICLE_PROMPT_PLAIN_LIMIT)
+        if qtext:
+            item["quoted_text"] = qtext
+        atext = article_text(extract_article(t), ARTICLE_PROMPT_PLAIN_LIMIT)
+        if atext:
+            item["article"] = atext
+        items.append(item)
     payload = json.dumps(items, ensure_ascii=False)
     return (
-        "以下はXのブックマーク投稿のリストです（JSON配列、各要素は id/text/links）。\n"
+        "以下はXのブックマーク投稿のリストです（JSON配列、各要素は id/text/links、"
+        "引用ポストの場合は引用先本文 quoted_text、X記事の場合は article も含む）。\n"
         "このうち、ソフトウェア開発・プログラミング・AI活用開発・技術ツールに"
         "役立つと判断できる投稿の id だけを含む JSON 配列を1つだけ返してください。\n"
         "説明・前置き・コードブロックのフェンスは不要です。該当が無ければ [] を返してください。\n\n"
@@ -916,6 +1086,7 @@ def classify_and_persist(tweets, data_dir, filt_cfg, filter_enabled, token=None,
             filter_label=filter_label,
             replies_list=replies_list,
             media=media_list,
+            quoted=t.get("_quoted"),
         )
         if record is None:
             return False
@@ -935,7 +1106,12 @@ def classify_and_persist(tweets, data_dir, filt_cfg, filter_enabled, token=None,
     need_claude = []
     for t in tweets:
         body, links = build_body_and_links(t)
-        match = match_filter(body, links, keywords, domains)
+        qtext, qlinks = quoted_filter_parts(t)
+        own_atext = article_text(extract_article(t))
+        match = match_filter(
+            body + ("\n" + own_atext if own_atext else "") + ("\n" + qtext if qtext else ""),
+            links + qlinks, keywords, domains,
+        )
         if match:
             if _persist(t, match):
                 saved += 1
@@ -1143,12 +1319,47 @@ def cmd_auth(args):
 
 
 # ---------------------------------------------------------------------------
+# 引用ポストの解決
+# ---------------------------------------------------------------------------
+
+
+def resolve_quoted(tweet, tweets_by_id, media_by_key):
+    """tweet.referenced_tweets から引用(type=quoted)を探し、引用先情報を組み立てる。
+
+    引用でなければ None。引用先が includes.tweets に無ければ
+    {"id", "unavailable": True}（削除・非公開など）。ID が不正なら None。
+    """
+    for ref in tweet.get("referenced_tweets") or []:
+        if not isinstance(ref, dict) or ref.get("type") != "quoted":
+            continue
+        qid = str(ref.get("id") or "")
+        if not is_valid_tweet_id(qid):
+            print(f"警告: 不正な引用先ID '{qid}' のため引用情報は付けません。")
+            return None
+        qt = (tweets_by_id or {}).get(qid)
+        if not qt:
+            return {"id": qid, "unavailable": True}
+        body, links = build_body_and_links(qt)
+        out = {"id": qid, "text": body, "links": links}
+        if qt.get("author_id") is not None:
+            out["author_id"] = str(qt.get("author_id"))
+        if qt.get("created_at"):
+            out["created_at"] = qt.get("created_at")
+        out["media"] = build_media_list(qt, media_by_key)
+        qa = extract_article(qt)
+        if qa:
+            out["article"] = qa
+        return out
+    return None
+
+
+# ---------------------------------------------------------------------------
 # sync サブコマンド
 # ---------------------------------------------------------------------------
 
 
 def run_sync(cfg, token, home, data_dir, full=False, max_pages=10, page_size=None,
-             no_filter=False, no_replies=False):
+             no_filter=False, no_replies=False, no_quoted=False):
     """ブックマーク同期の中核処理（テストから直接呼び出し可能）。"""
     now = time.time()
     if token.get("expires_at", 0) - 60 <= now:
@@ -1187,6 +1398,10 @@ def run_sync(cfg, token, home, data_dir, full=False, max_pages=10, page_size=Non
             "search_count": 0,
         }
 
+    quoted_cfg = get_quoted_config(cfg)
+    quoted_enabled = (not no_quoted) and bool(quoted_cfg.get("enabled", True))
+    total_quoted = 0
+
     total_saved = 0
     total_skipped = 0
     total_pending = 0
@@ -1221,9 +1436,9 @@ def run_sync(cfg, token, home, data_dir, full=False, max_pages=10, page_size=Non
             current_page_size = page_size
 
         params = {
-            "tweet.fields": TWEET_FIELDS,
+            "tweet.fields": TWEET_FIELDS + ("," + QUOTED_TWEET_FIELD if quoted_enabled else ""),
             "max_results": str(current_page_size),
-            "expansions": MEDIA_EXPANSIONS,
+            "expansions": MEDIA_EXPANSIONS + ("," + QUOTED_EXPANSIONS if quoted_enabled else ""),
             "media.fields": MEDIA_FIELDS,
         }
         if next_token:
@@ -1268,11 +1483,20 @@ def run_sync(cfg, token, home, data_dir, full=False, max_pages=10, page_size=Non
             m.get("media_key"): m
             for m in ((resp.get("includes") or {}).get("media") or [])
         }
+        tweets_by_id = {
+            str(x.get("id")): x
+            for x in ((resp.get("includes") or {}).get("tweets") or [])
+        }
         for t in tweets:
-            # includes.media は取得時にしか手に入らないため、この時点で
-            # 各tweetに解決済みのmedia一覧を埋め込んでおく（pending化されても
+            # includes.media / includes.tweets は取得時にしか手に入らないため、この時点で
+            # 各tweetに解決済みの media・引用先を埋め込んでおく（pending化されても
             # 失われないように）。
             t["_media"] = build_media_list(t, media_by_key)
+            if quoted_enabled:
+                q = resolve_quoted(t, tweets_by_id, media_by_key)
+                if q is not None:
+                    t["_quoted"] = q
+                    total_quoted += 1
 
         new_in_page = []
         hit_known = False
@@ -1307,16 +1531,19 @@ def run_sync(cfg, token, home, data_dir, full=False, max_pages=10, page_size=Non
     bookmark_cost = total_fetched * COST_PER_TWEET_USD
     reply_count = replies_ctx["search_count"] if replies_ctx else 0
     reply_cost = reply_count * COST_PER_REPLY_SEARCH_USD
-    total_cost = bookmark_cost + reply_cost
+    quoted_cost = total_quoted * COST_PER_QUOTED_USD
+    total_cost = bookmark_cost + reply_cost + quoted_cost
     print(
         f"取得リソース数: {total_fetched}件 / 保存数: {total_saved}件 / "
         f"除外数: {total_skipped}件 / 保留数: {total_pending}件 / "
-        f"返信取得数: {reply_count}件 / 概算費用: ${total_cost:.3f}"
+        f"返信取得数: {reply_count}件 / quoted={total_quoted}件 / "
+        f"概算費用: ${total_cost:.3f}（うち引用先 ${quoted_cost:.3f}、未確認の安全側見積もり）"
     )
     append_usage_log(
         data_dir, total_fetched, total_saved, bookmark_cost,
         skipped=total_skipped, pending=total_pending,
         reply_count=reply_count, reply_cost_usd=reply_cost,
+        quoted_count=total_quoted, quoted_cost_usd=quoted_cost,
     )
     return 0
 
@@ -1341,6 +1568,7 @@ def cmd_sync(args):
         page_size=args.page_size,
         no_filter=args.no_filter,
         no_replies=args.no_replies,
+        no_quoted=args.no_quoted,
     )
 
 
@@ -1680,6 +1908,587 @@ def cmd_clean_replies(args):
 
 
 # ---------------------------------------------------------------------------
+# quoted サブコマンド（保存済み投稿への引用先の後追い）
+# ---------------------------------------------------------------------------
+
+_STATUS_PATH_RE = re.compile(r"/status/([0-9]{1,25})(?:/|$)")
+
+
+def _parse_fm_links(fm_text):
+    """frontmatter の `links:` ブロックの URL 一覧を返す。"""
+    links = []
+    in_links = False
+    for line in fm_text.split("\n"):
+        if line.startswith("links:"):
+            in_links = True
+            continue
+        if in_links:
+            m = re.match(r"^\s+-\s+(.*)$", line)
+            if m:
+                links.append(_yaml_dunquote(m.group(1)))
+                continue
+            in_links = False
+    return links
+
+
+def find_quoted_candidates(data_dir):
+    """frontmatter に `quoted:` が無く、links に自分以外の status URL を含む md を新しい順に列挙する。"""
+    data_dir = Path(data_dir)
+    bookmarks_dir = data_dir / "bookmarks"
+    out = []
+    if not bookmarks_dir.exists():
+        return out
+    for path in sorted(bookmarks_dir.glob("*/*.md")):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        m = _FRONTMATTER_RE.match(text)
+        if not m:
+            continue
+        fm_text = m.group(1)
+        if _fm_has_key(fm_text, "quoted"):
+            continue
+        tid = _extract_fm_field(fm_text, "id")
+        if not is_valid_tweet_id(tid):
+            print(f"警告: 不正な投稿ID '{tid}' のため引用バックフィル対象から除外します: {path}")
+            continue
+        has_other_status = False
+        for link in _parse_fm_links(fm_text):
+            parsed = urllib.parse.urlparse(link)
+            if parsed.netloc.lower() not in SELF_LINK_DOMAINS:
+                continue
+            sm = _STATUS_PATH_RE.search(parsed.path)
+            if sm and sm.group(1) != tid:
+                has_other_status = True
+                break
+        if not has_other_status:
+            continue
+        out.append({
+            "path": path,
+            "id": tid,
+            "created_at": _extract_fm_field(fm_text, "created_at") or "",
+        })
+    out.sort(key=lambda c: c["created_at"], reverse=True)
+    return out
+
+
+_NOT_SET = object()
+
+
+def _quoted_block_range(fm_lines):
+    """frontmatter 行リスト内の `quoted:` ブロック（値なし）の [start, end) を返す。無ければ None。"""
+    for i, line in enumerate(fm_lines):
+        if line == "quoted:":
+            end = i + 1
+            while end < len(fm_lines) and fm_lines[end].startswith(" "):
+                end += 1
+            return i, end
+    return None
+
+
+def _insert_body_section(body, snippet, before_headings):
+    """snippet（先頭は空行）を、指定見出しのうち最初に現れるものの直前へ挿入する。無ければ末尾。"""
+    idxs = [body.find("\n" + h) for h in before_headings]
+    idxs = [i for i in idxs if i >= 0]
+    if not idxs:
+        return body.rstrip("\n") + snippet
+    idx = min(idxs)
+    head, tail = body[:idx].rstrip("\n"), body[idx:]
+    if tail.startswith("\n" + QUOTED_SECTION_HEADING):
+        tail = "\n" + tail  # 引用節の前は空行を1つ空ける（save_tweet の組み立てと揃える）
+    return head + snippet + tail
+
+
+def apply_enrichment(path, media=None, article=_NOT_SET, quoted=_NOT_SET, quoted_article=_NOT_SET):
+    """保存済み md に、未保存の media / article / quoted / quoted.article を後付けする。
+
+    media: None なら触らない。リスト（空でも）なら `media:` を追加。
+    article / quoted: _NOT_SET なら触らない。None なら `article: null` / `quoted: null`、
+      dict なら内容を追加（本文節も挿入）。
+    quoted_article: 既存の `quoted:` ブロックに `article` を追加する（None なら `article: null`）。
+    既にキーがあるものは書き換えない。何か書き換えたら True。
+    """
+    text = path.read_text(encoding="utf-8")
+    m = _FRONTMATTER_RE.match(text)
+    if not m:
+        return False
+    fm_text, raw_rest = m.group(1), m.group(2)
+    body = raw_rest[1:] if raw_rest.startswith("\n") else raw_rest
+    body = body.rstrip("\n")
+    fm_lines = fm_text.split("\n")
+    changed = False
+
+    # 既存 quoted ブロックへの article 追加（ブロック範囲は元の行リストで確定）
+    if quoted_article is not _NOT_SET:
+        rng = _quoted_block_range(fm_lines)
+        if rng and not any(l.startswith("  article:") for l in fm_lines[rng[0]:rng[1]]):
+            if quoted_article is None:
+                new_lines = ["  article: null"]
+            else:
+                new_lines = _render_article_lines(quoted_article, indent="  ")
+                qidx = body.find("\n" + QUOTED_SECTION_HEADING)
+                if qidx >= 0:
+                    end = body.find("\n## ", qidx + 1)
+                    if end < 0:
+                        end = len(body)
+                    body = body[:end].rstrip("\n") + format_quoted_article(quoted_article) + body[end:]
+            fm_lines[rng[1]:rng[1]] = new_lines
+            changed = True
+
+    if media is not None and not _fm_has_key(fm_text, "media"):
+        fm_lines.extend(_render_media_lines(media) if media else ["media: []"])
+        changed = True
+
+    if article is not _NOT_SET and not _fm_has_key(fm_text, "article"):
+        if article is None:
+            fm_lines.append("article: null")
+        else:
+            fm_lines.extend(_render_article_lines(article))
+            body = _insert_body_section(
+                body, format_article_section(article),
+                [QUOTED_SECTION_HEADING, REPLIES_SECTION_HEADING],
+            )
+        changed = True
+
+    if quoted is not _NOT_SET and not _fm_has_key(fm_text, "quoted"):
+        if quoted is None:
+            fm_lines.append("quoted: null")
+            changed = True
+        elif valid_quoted(quoted):
+            fm_lines.extend(_render_quoted_lines(quoted))
+            body = _insert_body_section(body, format_quoted_section(quoted), [REPLIES_SECTION_HEADING])
+            changed = True
+
+    if not changed:
+        return False
+    new_text = "---\n" + "\n".join(fm_lines) + "\n---\n\n" + body + "\n"
+    path.write_text(new_text, encoding="utf-8")
+    return True
+
+
+def backfill_quoted_into_file(path, quoted):
+    """保存済み md に引用先情報を後付けする。quoted=None なら `quoted: null` を書く。"""
+    return apply_enrichment(path, quoted=quoted)
+
+
+def stdin_is_tty():
+    return sys.stdin.isatty()
+
+
+def confirm_prompt(message):
+    # 端末判定をすり抜けて標準入力が閉じている環境では「実行しない」として扱う
+    try:
+        return input(message).strip().lower() in ("y", "yes")
+    except EOFError:
+        print()
+        return False
+
+
+def build_lookup_url(ids, with_own_media=False):
+    expansions = "referenced_tweets.id,referenced_tweets.id.attachments.media_keys"
+    if with_own_media:
+        expansions = "attachments.media_keys," + expansions
+    params = {
+        "ids": ",".join(ids),
+        "tweet.fields": "created_at,author_id,entities,note_tweet,referenced_tweets,article",
+        "expansions": expansions,
+        "media.fields": MEDIA_FIELDS,
+    }
+    return LOOKUP_TWEETS_URL + "?" + urllib.parse.urlencode(params, safe=",")
+
+
+def _run_lookup_backfill(label, cfg, token, home, data_dir, candidates, handler,
+                         yes=False, with_own_media=False):
+    """quoted / enrich 共通: 費用表示・確認・100件ずつ取得・失敗時は書かない・usage.log 記録。
+
+    handler(tweet, candidate, tweets_by_id, media_by_key) -> (tag or None, quoted_resolved: bool)
+    tag は書き込みを行った場合の集計用ラベル（書かなかったら None）。
+    """
+    data_dir = Path(data_dir)
+    n = len(candidates)
+    if n == 0:
+        print(f"{label}: 対象 0件。何もしません。")
+        return 0
+
+    post_cost = n * COST_PER_POST_READ_USD
+    quoted_cost_max = n * COST_PER_QUOTED_USD
+    print(
+        f"対象 {n}件 / 概算 ${post_cost + quoted_cost_max:.3f}"
+        f"（投稿 {n}×${COST_PER_POST_READ_USD} ＋ 引用先最大 {n}×${COST_PER_QUOTED_USD}。"
+        "引用先の課金は未確認の安全側見積もり）"
+    )
+    if not yes:
+        if not stdin_is_tty():
+            print("非対話環境で --yes が指定されていないため、実行せず終了します。")
+            return 1
+        if not confirm_prompt("実行しますか? [y/N]: "):
+            print("中止しました。")
+            return 0
+
+    now = time.time()
+    if token.get("expires_at", 0) - 60 <= now:
+        new_token, status = refresh_access_token(home, cfg, token)
+        if new_token is None:
+            print(
+                f"トークンのリフレッシュに失敗しました (status={status})。"
+                "`python xbm.py auth` をやり直してください。"
+            )
+            return 1
+        token = new_token
+
+    by_id = {c["id"]: c for c in candidates}
+    ids = list(by_id.keys())
+    fetched_total = 0
+    quoted_found = 0
+    tags = {}
+
+    for i in range(0, len(ids), LOOKUP_MAX_IDS):
+        batch = ids[i : i + LOOKUP_MAX_IDS]
+        try:
+            status, headers, body = http_request(
+                "GET", build_lookup_url(batch, with_own_media=with_own_media),
+                headers={"Authorization": f"Bearer {token['access_token']}"},
+            )
+        except Exception as e:
+            print(f"警告: 取得中にエラーが発生しました: {e}。このバッチは書き込まずに残します。")
+            continue
+        if status == 429:
+            print("警告: レート制限(429)のため、今回の実行を打ち切ります。")
+            break
+        if status != 200:
+            print(f"警告: 取得に失敗しました (status={status})。このバッチは書き込まずに残します。")
+            continue
+        try:
+            text = body.decode("utf-8") if isinstance(body, bytes) else body
+            resp = json.loads(text)
+        except Exception:
+            print("警告: 応答が不正なJSONです。このバッチは書き込まずに残します。")
+            continue
+
+        includes = resp.get("includes") or {}
+        media_by_key = {m.get("media_key"): m for m in (includes.get("media") or [])}
+        tweets_by_id = {str(x.get("id")): x for x in (includes.get("tweets") or [])}
+        returned = resp.get("data") or []
+        fetched_total += len(returned)
+        for t in returned:
+            c = by_id.get(str(t.get("id")))
+            if c is None:
+                continue
+            try:
+                tag, resolved = handler(t, c, tweets_by_id, media_by_key)
+            except Exception as e:
+                print(f"警告: {c['path']} の書き込み中にエラーが発生しました: {e}")
+                continue
+            if resolved:
+                quoted_found += 1
+            if tag:
+                tags[tag] = tags.get(tag, 0) + 1
+
+    cost_posts = fetched_total * COST_PER_POST_READ_USD
+    cost_quoted = quoted_found * COST_PER_QUOTED_USD
+    detail = " / ".join(f"{k} {v}件" for k, v in sorted(tags.items())) or "書き込みなし"
+    print(
+        f"{label}: 対象 {n}件 / 取得 {fetched_total}件 / {detail} / "
+        f"概算費用 ${cost_posts + cost_quoted:.3f}"
+    )
+    append_usage_log(
+        data_dir, fetched_total, 0, cost_posts,
+        quoted_count=quoted_found, quoted_cost_usd=cost_quoted,
+    )
+    return 0
+
+
+def run_quoted_backfill(cfg, token, home, data_dir, yes=False, limit=None):
+    """保存済み投稿のうち引用の可能性があるものを X API で取り直し、引用先を後付けする。"""
+    candidates = find_quoted_candidates(data_dir)
+    if limit is not None:
+        candidates = candidates[:limit]
+
+    def handler(t, c, tweets_by_id, media_by_key):
+        q = resolve_quoted(t, tweets_by_id, media_by_key)
+        wrote = backfill_quoted_into_file(c["path"], q)
+        tag = None
+        if wrote:
+            tag = "引用なし(quoted: null)" if q is None else "引用あり"
+        return tag, q is not None
+
+    return _run_lookup_backfill("引用バックフィル", cfg, token, home, data_dir, candidates, handler, yes=yes)
+
+
+# ---------------------------------------------------------------------------
+# enrich サブコマンド（media 未保存・X 記事未保存の既存投稿の後追い）
+# ---------------------------------------------------------------------------
+
+
+def find_enrich_candidates(data_dir):
+    """media 未保存、または記事リンクがあるのに article が未保存の md を新しい順に列挙する。"""
+    bookmarks_dir = Path(data_dir) / "bookmarks"
+    out = []
+    if not bookmarks_dir.exists():
+        return out
+    for path in sorted(bookmarks_dir.glob("*/*.md")):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        m = _FRONTMATTER_RE.match(text)
+        if not m:
+            continue
+        fm_text, raw_rest = m.group(1), m.group(2)
+        tid = _extract_fm_field(fm_text, "id")
+        if not is_valid_tweet_id(tid):
+            print(f"警告: 不正な投稿ID '{tid}' のため enrich 対象から除外します: {path}")
+            continue
+        body = raw_rest[1:] if raw_rest.startswith("\n") else raw_rest
+        main_part = body.split("\n## ", 1)[0]
+
+        need_media = not _fm_has_key(fm_text, "media")
+        need_article = ARTICLE_URL_MARKER in main_part and not _fm_has_key(fm_text, "article")
+        need_quoted = not _fm_has_key(fm_text, "quoted")
+        need_qarticle = False
+        rng = _quoted_block_range(fm_text.split("\n"))
+        if rng:
+            block = fm_text.split("\n")[rng[0]:rng[1]]
+            qtext = ""
+            for line in block:
+                if line.startswith("  text:"):
+                    qtext = _yaml_dunquote(line[len("  text:"):])
+            need_qarticle = (
+                ARTICLE_URL_MARKER in qtext
+                and not any(l.startswith("  article:") for l in block)
+            )
+        if not (need_media or need_article or need_qarticle):
+            continue
+        out.append({
+            "path": path, "id": tid,
+            "created_at": _extract_fm_field(fm_text, "created_at") or "",
+            "need_media": need_media, "need_article": need_article,
+            "need_quoted": need_quoted, "need_qarticle": need_qarticle,
+        })
+    out.sort(key=lambda c: c["created_at"], reverse=True)
+    return out
+
+
+def run_enrich_backfill(cfg, token, home, data_dir, yes=False, limit=None):
+    candidates = find_enrich_candidates(data_dir)
+    if limit is not None:
+        candidates = candidates[:limit]
+
+    def handler(t, c, tweets_by_id, media_by_key):
+        q = resolve_quoted(t, tweets_by_id, media_by_key)
+        kwargs = {}
+        if c["need_media"]:
+            kwargs["media"] = build_media_list(t, media_by_key)
+        if c["need_article"]:
+            kwargs["article"] = extract_article(t)
+        if c["need_quoted"]:
+            kwargs["quoted"] = q
+        if c["need_qarticle"]:
+            kwargs["quoted_article"] = (q or {}).get("article") if q and not q.get("unavailable") else None
+        wrote = apply_enrichment(c["path"], **kwargs)
+        return ("更新" if wrote else None), q is not None
+
+    return _run_lookup_backfill(
+        "enrich", cfg, token, home, data_dir, candidates, handler, yes=yes, with_own_media=True
+    )
+
+
+def cmd_enrich(args):
+    home = default_home_dir()
+    data_dir = default_data_dir()
+    cfg = load_config(home)
+    token = load_token(home)
+    if cfg is None or token is None:
+        print("認証情報がありません。先に `python xbm.py auth` を実行してください。")
+        return 1
+    return run_enrich_backfill(cfg, token, home, data_dir, yes=args.yes, limit=args.limit)
+
+
+def cmd_quoted(args):
+    home = default_home_dir()
+    data_dir = default_data_dir()
+    cfg = load_config(home)
+    token = load_token(home)
+    if cfg is None or token is None:
+        print("認証情報がありません。先に `python xbm.py auth` を実行してください。")
+        return 1
+    return run_quoted_backfill(cfg, token, home, data_dir, yes=args.yes, limit=args.limit)
+
+
+# ---------------------------------------------------------------------------
+# download-media サブコマンド（動画・画像の個別ダウンロード）
+# ---------------------------------------------------------------------------
+
+
+def parse_fm_media(fm_text):
+    """frontmatter から (media, quoted.media) のエントリ一覧を取り出す。"""
+    result = {"media": [], "quoted": []}
+    section = None
+    for line in fm_text.split("\n"):
+        if line.startswith("media:"):
+            section = "media"
+            continue
+        if line.startswith("quoted:"):
+            section = "quoted"
+            continue
+        if not line.startswith(" "):
+            section = None
+            continue
+        if section in ("quoted", "quoted_media") and re.match(r"^  [A-Za-z_]+:", line):
+            section = "quoted_media" if line.startswith("  media:") else "quoted"
+            continue
+        if section == "media":
+            target = result["media"]
+        elif section == "quoted_media":
+            target = result["quoted"]
+        else:
+            continue
+        m = re.match(r"^\s+(- )?([A-Za-z_]+):\s*(.*)$", line)
+        if not m:
+            continue
+        if m.group(1) or not target:
+            target.append({})
+        raw = m.group(3)
+        value = _yaml_dunquote(raw)
+        if raw.strip().isdigit():
+            value = int(raw.strip())
+        target[-1][m.group(2)] = value
+    return result
+
+
+def is_allowed_download_url(url):
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return False
+    return parsed.scheme == "https" and (parsed.hostname or "").lower() in ALLOWED_DOWNLOAD_HOSTS
+
+
+class _HostCheckRedirect(urllib.request.HTTPRedirectHandler):
+    """リダイレクト先も許可ホストに限る。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not is_allowed_download_url(newurl):
+            raise urllib.error.URLError(f"許可されていないホストへのリダイレクト: {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def open_stream(url, timeout=30):
+    """ダウンロード用にストリームを開く（テストでモックしやすいよう分離）。"""
+    opener = urllib.request.build_opener(_HostCheckRedirect)
+    return opener.open(urllib.request.Request(url), timeout=timeout)
+
+
+def download_file(url, dest, max_bytes=MAX_DOWNLOAD_BYTES):
+    """url を dest に保存する。サイズ上限を超えたら中断して部分ファイルを削除し例外を送出する。"""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_name(dest.name + ".part")
+    try:
+        with open_stream(url) as resp:
+            length = None
+            try:
+                length = resp.headers.get("Content-Length")
+            except Exception:
+                pass
+            if length is not None and str(length).isdigit() and int(length) > max_bytes:
+                raise ValueError(f"Content-Length {length} が上限 {max_bytes} バイトを超えています")
+            total = 0
+            with part.open("wb") as f:
+                while True:
+                    chunk = resp.read(DOWNLOAD_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError(f"サイズが上限 {max_bytes} バイトを超えました")
+                    f.write(chunk)
+        part.replace(dest)
+    except BaseException:
+        try:
+            part.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _media_source(entry):
+    """media エントリからダウンロード元URLと既定拡張子を返す（無ければ None）。"""
+    if entry.get("video_url"):
+        return entry["video_url"], ".mp4"
+    if entry.get("type") == "photo" and entry.get("url"):
+        return entry["url"], ".jpg"
+    return None
+
+
+def _url_extension(url, default):
+    suffix = Path(urllib.parse.urlparse(url).path).suffix.lower()
+    if re.fullmatch(r"\.[a-z0-9]{1,5}", suffix or ""):
+        return suffix
+    return default
+
+
+def find_bookmark_md(data_dir, tweet_id):
+    for p in sorted((Path(data_dir) / "bookmarks").glob(f"*/{tweet_id}.md")):
+        return p
+    return None
+
+
+def run_download_media(data_dir, tweet_ids):
+    data_dir = Path(data_dir)
+    media_dir = data_dir / "media"
+    failures = 0
+    downloaded = 0
+    skipped = 0
+    for tid in tweet_ids:
+        if not is_valid_tweet_id(tid):
+            print(f"警告: 不正な投稿ID '{tid}' をスキップします。")
+            failures += 1
+            continue
+        path = find_bookmark_md(data_dir, tid)
+        if path is None:
+            print(f"警告: 投稿 {tid} の md が data/bookmarks に見つかりません。")
+            failures += 1
+            continue
+        m = _FRONTMATTER_RE.match(path.read_text(encoding="utf-8"))
+        if not m:
+            print(f"警告: {path} の frontmatter を解釈できません。")
+            failures += 1
+            continue
+        parsed = parse_fm_media(m.group(1))
+        for label, entries in (("", parsed["media"]), ("-q", parsed["quoted"])):
+            for n, entry in enumerate(entries, start=1):
+                src = _media_source(entry)
+                if src is None:
+                    continue
+                url, default_ext = src
+                if not is_allowed_download_url(url):
+                    print(f"警告: 許可されていないURLのため拒否しました: {url}")
+                    failures += 1
+                    continue
+                dest = media_dir / f"{tid}{label}-{n}{_url_extension(url, default_ext)}"
+                if dest.exists():
+                    print(f"スキップ（既存）: {dest.name}")
+                    skipped += 1
+                    continue
+                try:
+                    download_file(url, dest)
+                except Exception as e:
+                    print(f"警告: ダウンロードに失敗しました ({dest.name}): {e}")
+                    failures += 1
+                    continue
+                print(f"保存: {dest}")
+                downloaded += 1
+    print(f"download-media: 保存 {downloaded}件 / 既存スキップ {skipped}件 / 失敗・拒否 {failures}件")
+    return 1 if failures else 0
+
+
+def cmd_download_media(args):
+    return run_download_media(default_data_dir(), args.tweet_ids)
+
+
+# ---------------------------------------------------------------------------
 # CLI エントリポイント
 # ---------------------------------------------------------------------------
 
@@ -1723,6 +2532,32 @@ def build_arg_parser():
         action="store_true",
         help="保存する投稿についての投稿者本人リプライ取得を無効にする",
     )
+
+    sync_p.add_argument(
+        "--no-quoted",
+        action="store_true",
+        help="引用ポストの引用先を同じリクエストで取得する処理を無効にする",
+    )
+
+    quoted_p = sub.add_parser(
+        "quoted",
+        help="frontmatterに quoted: が無い保存済み投稿の引用先を、X API で取り直して後追い保存する",
+    )
+    quoted_p.add_argument("--yes", action="store_true", help="費用確認のプロンプトを省略する")
+    quoted_p.add_argument("--limit", type=int, default=None, help="処理する投稿数の上限（新しい順）")
+
+    enrich_p = sub.add_parser(
+        "enrich",
+        help="media が未保存、または X 記事（article）が未保存の保存済み投稿を、X API で取り直して後追い保存する",
+    )
+    enrich_p.add_argument("--yes", action="store_true", help="費用確認のプロンプトを省略する")
+    enrich_p.add_argument("--limit", type=int, default=None, help="処理する投稿数の上限（新しい順）")
+
+    dl_p = sub.add_parser(
+        "download-media",
+        help="指定した投稿の動画・画像（引用先含む）を data/media/ にダウンロードする",
+    )
+    dl_p.add_argument("tweet_ids", nargs="+", help="投稿ID（1つ以上）")
 
     replies_p = sub.add_parser(
         "replies",
@@ -1768,6 +2603,12 @@ def main(argv=None):
         return cmd_replies(args)
     if args.command == "clean-replies":
         return cmd_clean_replies(args)
+    if args.command == "quoted":
+        return cmd_quoted(args)
+    if args.command == "enrich":
+        return cmd_enrich(args)
+    if args.command == "download-media":
+        return cmd_download_media(args)
 
     parser.print_help()
     return 1
