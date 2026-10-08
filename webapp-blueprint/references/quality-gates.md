@@ -259,10 +259,24 @@ jobs:
       - uses: actions/setup-node@<SHA> # v4.x.x
         with:
           node-version-file: .nvmrc
-      - run: npm ci --ignore-scripts
+      - run: npm ci --ignore-scripts # 依存のインストール時スクリプトを一律には実行しない
+      # インストール時の処理（コード生成・ネイティブモジュールのビルド等）が必要な依存は、
+      # 審査したものだけ名前を指定して実行する。不要なら、この行は削除する
+      # （.npmrc に ignore-scripts=true がある場合も実行されるよう、明示的に false を渡す）
+      - run: npm rebuild <審査済みのパッケージ名> --ignore-scripts=false
       - run: npm audit --audit-level=high
       - run: npm run build
-      # gitleaks は版とチェックサムを固定して取得したうえで実行する
+      # gitleaks は実行環境に入っていないため、版とチェックサムを固定して取得する
+      # （チェックサムはリリースページの checksums.txt にある linux_x64 の値）
+      - name: install gitleaks
+        env:
+          GITLEAKS_VERSION: "<版。例 8.28.0>"
+          GITLEAKS_SHA256: "<64桁のチェックサム>"
+        run: |
+          curl -sSfLo gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo install gitleaks /usr/local/bin/gitleaks
       - run: gitleaks git --redact
       - run: gitleaks dir --redact ./dist # ビルド成果物（出力先はフレームワークに合わせる）
 ```
@@ -270,9 +284,17 @@ jobs:
 **本番の応答を確かめるコマンド**（`https://example.com` は本番 URL に置き換える）:
 
 ```bash
-# セキュリティヘッダ: 6種類が出力されること
-# （x-frame-options は、CSP の frame-ancestors で代替していれば出なくてよい）
-curl -sI https://example.com/ | grep -iE '^(content-security-policy|strict-transport-security|x-content-type-options|referrer-policy|permissions-policy|x-frame-options):'
+# セキュリティヘッダ: 必要なヘッダを1つずつ確かめ、1つでも欠けていれば失敗する。
+# クリックジャッキング対策は、CSP の frame-ancestors か X-Frame-Options のどちらかがあればよい
+headers=$(curl -sI https://example.com/)
+missing=0
+for h in content-security-policy strict-transport-security x-content-type-options referrer-policy permissions-policy; do
+  printf '%s\n' "$headers" | grep -qi "^$h:" || { echo "MISSING: $h"; missing=1; }
+done
+printf '%s\n' "$headers" | grep -i '^content-security-policy:' | grep -qi 'frame-ancestors' \
+  || printf '%s\n' "$headers" | grep -qi '^x-frame-options:' \
+  || { echo "MISSING: frame-ancestors / x-frame-options"; missing=1; }
+test "$missing" -eq 0 && echo "all security headers present"
 
 # HTTP から HTTPS へのリダイレクト: 301 または 308 で https:// へ飛ぶこと
 curl -sI http://example.com/ | grep -iE '^(HTTP/|location:)'
@@ -318,7 +340,7 @@ curl -sI -X POST https://example.com/api/login | grep -i '^set-cookie:'
 削除する場合は理由を設計書に明記する。
 
 - [ ] `references/security-baseline.md`のリリース前セキュリティチェックリスト（該当レベル分）を満たしている
-- [ ] 「脆弱性ゼロ」の3条件を満たしている（依存監査・シークレット検出・SAST で High 以上の未対応0件、
+- [ ] 「脆弱性ゼロ」の3条件を満たしている（依存監査・シークレット検出・SAST（L2 以上、L1 は実施する場合）で High 以上の未対応0件、
       未分類の指摘なし、セキュリティ項目の ✅ すべてに根拠あり）
 - [ ] 本番の応答確認（セキュリティヘッダ・HTTPS へのリダイレクト・非公開ファイル）が期待どおりである
 - [ ] PRの品質ゲート（型チェック・Lint・テスト・ビルド・セキュリティ検査）がすべて通過している
