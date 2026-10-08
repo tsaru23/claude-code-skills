@@ -222,7 +222,7 @@ WCAG 2.2のAAレベルを基準とする。
 | 検査 | 見つけるもの | ツール例 | 失敗させる条件 | 実行タイミング | 適用レベル |
 |---|---|---|---|---|---|
 | 依存の脆弱性監査 | 既知の脆弱性を持つ依存パッケージ | `npm audit --audit-level=high`、`pnpm audit --audit-level high`、Dependabot alerts | High 以上が1件でもある | PR ごと＋定期（週1回以上） | L1必須／L2必須／L3必須 |
-| シークレット検出 | コミット履歴・ビルド成果物に混入した API キー・秘密鍵 | gitleaks（`gitleaks git` で履歴、`gitleaks dir` でビルド成果物）、GitHub の secret scanning と push protection | 1件でもある | PR ごと（コミット前フックでも実行するとなおよい） | L1必須／L2必須／L3必須 |
+| シークレット検出 | コミット履歴・ビルド成果物に混入した API キー・秘密鍵 | gitleaks（`gitleaks git` で履歴、`gitleaks dir` でビルド成果物）、GitHub の secret scanning と push protection | 1件でもある | コミット前（コミット前フックまたは push protection）と PR ごとの両方。CI で見つかった時点ではすでに漏洩しているため、コミット前の検査を省略しない | L1必須／L2必須／L3必須 |
 | 静的解析（SAST） | インジェクション・XSS・安全でない乱数など、コード上の脆弱なパターン | CodeQL（GitHub の code scanning）、Semgrep | High 以上が1件でもある（CodeQL は保護ルールの失敗しきい値を「High or higher」にする） | PR ごと | L1推奨／L2必須／L3必須 |
 | CI 設定の検査 | 版を固定していないアクション、広すぎる権限、`pull_request_target` の危険な使い方 | actionlint、zizmor | 指摘が1件でもある | ワークフローを変更した PR | L1推奨／L2必須／L3必須 |
 | 動的検査（DAST） | 実際の応答に現れる問題（ヘッダの欠落、Cookie 属性、エラー時の情報露出等） | OWASP ZAP baseline scan（攻撃を伴わない受動的な検査） | FAIL に分類した警告が1件でもある | プレビュー環境またはステージングに対して、リリース前 | L1推奨／L2必須／L3必須 |
