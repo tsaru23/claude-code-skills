@@ -101,11 +101,11 @@ Figma MCP・21st.dev Magic MCP・Lovable MCP といった情報源をコスト�
 - `get_theme` が返すテーマCSSは無料。ただしカタログは薄い（実測: 「dark theme」で1件）
 - **配布形態は shadcn レジストリ**。`search` の結果に含まれる `installCommand` は
   `https://21st.dev/r/AUTHOR/NAME?api_key=$API_KEY_21ST` を `shadcn add` に渡す形で、
-  CLI の版が `@latest` になっている。**そのまま実行せず**、版を固定し、Step 4 の
-  「取り込み前後の確認」を通してから取り込む。CLI で取り込む場合は環境変数 `API_KEY_21ST` が
-  必要で、キーの設定はユーザーに依頼する
-- **URL にAPIキーが入る**ので、キーの値をコマンドライン・ログ・ドキュメントに出さない。
-  コマンドには必ず `$API_KEY_21ST` のまま書き、`docs/design-sources.md` などに出典を記録するときは
+  CLI の版が `@latest` になっている。**このコマンドは実行しない。** Step 4 の
+  「取り込み前後の確認」に沿って JSON を保存・確認し、そのファイルから取り込む。
+  JSON の取得には環境変数 `API_KEY_21ST` が必要で、キーの設定はユーザーに依頼する
+- **URL にAPIキーが入る**ので、キーの値をコマンドライン引数・ログ・ドキュメントに出さない。
+  `docs/design-sources.md` などに出典を記録するときは
   `?api_key=...` を除いた `https://21st.dev/r/AUTHOR/NAME` だけを書く
 - 書き込み系（`submit_component` `edit_profile` `delete_*` など）は**ユーザーに明示的に
   頼まれない限り呼ばない**
@@ -135,6 +135,9 @@ gh search repos "portfolio template" --stars=">1000" --sort stars --limit 5 --js
 gh api repos/OWNER/REPO/contents/PATH -H "Accept: application/vnd.github.raw"
 ```
 
+これは中身を読むための形で、`ref` を省くと既定ブランチの最新が返る。**取り込むファイル**は
+Step 4 のとおり `?ref=<SHA>` を付けて SHA で固定する。
+
 コツと落とし穴:
 
 - **クエリは2語程度から始める。** 3語以上に絞ると `--stars` の閾値と噛み合って0件になりやすい
@@ -163,50 +166,64 @@ star数だけで選ばないこと。
 - 系統Aの場合: `get_add_command_for_items` で得たコマンドを、CLI の版を `npx shadcn@<版>` に
   書き換えたうえで、下の「取り込み前後の確認」に沿って実行する。最後に `get_audit_checklist` を
   必ず走らせる
-- GitHub由来のコードを取り込む場合: ブランチ名ではなく**コミット SHA で固定**した URL
-  （`gh api repos/OWNER/REPO/commits/BRANCH --jq .sha` で調べる）から取得する。
+- GitHub由来のコードを取り込む場合: ブランチ名ではなく**コミット SHA で固定**して取得する。
+  SHA は `gh api repos/OWNER/REPO/commits/BRANCH --jq .sha` で調べ、ファイル単体の取得では
+  `ref` に SHA を渡す（`ref` を省くと既定ブランチの最新が返り、記録した SHA と中身がずれる）
+
+  ```bash
+  gh api "repos/OWNER/REPO/contents/PATH?ref=<SHA>" -H "Accept: application/vnd.github.raw"
+  ```
+
   **ライセンス表記を保持**し、ファイル冒頭に出典URL（SHA入り）をコメントで残す
+- 既存のデザイントークン（CSS変数 / `tailwind.config` / `globals.css`）に合わせて色・角丸・
+  タイポを**必ず上書き調整**する。素のまま貼るとテンプレート臭が出る
+- 適用後の検証: `webapp-testing` スキルまたは `/run` で実際に起動してスクリーンショットを撮り、
+  ユーザーに見せる
 
 ### 取り込み前後の確認（shadcn 互換レジストリ全般）
 
 レジストリから取り込むと、ソースがプロジェクトに書き込まれ、項目に書かれた npm パッケージも
 インストールされる。shadcn/ui・21st.dev・GitHub 上のレジストリのいずれでも、次の順で進める。
+要点は「**確認したファイルそのものを取り込む**」こと。確認のあとに URL から取り直すと、
+その間にレジストリ側が変わっていても気づけない。
 
 1. **版を固定する。** `npm view shadcn version` で CLI の版を調べ、`npx shadcn@<版>` で実行する。
+   ローカルの JSON ファイルを `add` に渡せる版を選ぶ（作業ブランチで一度試して確かめる）。
    Git 上のレジストリ JSON を使うときは、URL のブランチ名部分をコミット SHA に置き換える
-2. **取り込む前に JSON を読む。** レジストリ項目の JSON を取得して、次を確かめる
+2. **JSON を取得してファイルに保存し、読む。** 次を確かめる
    - `dependencies` / `devDependencies`: 増える npm パッケージが妥当か。版指定がなければ
      実行時点の最新版が入る点に注意する（依存の審査は `webapp-blueprint/references/tech-stack.md`）
    - `files`: ソースに外部への通信・`eval`・`dangerouslySetInnerHTML` など、用途から見て
      不要な処理がないか
-   - `registryDependencies`: さらに別の URL から取り込む項目がないか。あれば、その項目にも
-     同じ確認をする
-3. **取り込んで差分を見る。** 作業ブランチで add を実行し、`git diff` と
-   ロックファイル（`package-lock.json` / `pnpm-lock.yaml` など）の差分をすべて確認してから
-   コミットする
-4. **記録する。** Step 5 の項目に、SHA（Git から取り込んだ場合）・CLI の版・取得日を加える
+   - `registryDependencies`: `button` `utils` のような名前だけの項目は shadcn/ui 本体から入る。
+     それ以外（URL、`owner/repo/item` のような GitHub 上の項目、他レジストリの `@名前/項目`）は
+     親項目の SHA を**引き継がない**。それぞれをコミット SHA 付きの URL に解決し、同じ手順で
+     保存・確認する
+3. **保存したファイルから取り込む。** 名前だけでない `registryDependencies` は、確認済みの
+   ファイルから依存の深い順に先に取り込み、親の JSON の写しからはその項目を外してから
+   `npx shadcn@<版> add ./保存したファイル.json` を実行する（外さないと CLI が URL から取り直す）。
+   使える版でローカルファイルを受け付けない場合は CLI を使わず、確認した JSON の
+   `files[].content` を `files[].path` に手で置き、`dependencies` を自分で追加する
+4. **差分を見る。** 作業ブランチで、`git diff` とロックファイル（`package-lock.json` /
+   `pnpm-lock.yaml` など）の差分をすべて確認してからコミットする
+5. **記録する。** Step 5 の項目に、SHA（Git から取り込んだ場合）・CLI の版・取得日を加える
 
-shadcn/ui 公式や Git 上の JSON は、`curl -s <URL>` でそのまま取得してよい。
+shadcn/ui 公式や Git 上の JSON は、`curl -sf <URL> -o <保存先>` でそのまま取得してよい。
 
 21st.dev の JSON は URL に APIキーが入るため、キーをコマンドライン引数・シェル履歴・ログに
 出さない形で取得する。`--data-urlencode "api_key@-"` は値を標準入力から読むので、
-キーがプロセスの引数にも現れない。取得結果はファイルに保存して読む。
+キーがプロセスの引数にも現れない。
 
 ```bash
 printf '%s' "$API_KEY_21ST" | curl -sfG "https://21st.dev/r/AUTHOR/NAME" --data-urlencode "api_key@-" -o /tmp/21st-NAME.json
 ```
 
 - `curl -v` や `set -x` は URL（キー入り）を出力するので使わない
-- 読んで問題がなければ、確認したそのファイルを `npx shadcn@<版> add /tmp/21st-NAME.json` で
-  取り込むと、確認した内容と取り込む内容が一致する。CLI の版がローカルファイルを受け付けない
-  場合は、`npx shadcn@<版> add "https://21st.dev/r/AUTHOR/NAME?api_key=$API_KEY_21ST"` の形で
-  実行する（キーは環境変数のまま渡し、値を直接書かない）
+- 取り込みは手順3のとおり、保存した `/tmp/21st-NAME.json` から行う。
+  `installCommand` のように `?api_key=$API_KEY_21ST` 付きの URL を `shadcn add` に渡す形は使わない。
+  シェルが変数を展開した時点でキーがプロセスの引数に入り、プロセス一覧などから見えてしまう
 - CLI のエラー出力に URL が含まれることがあるので、出力をそのままドキュメントや
   Issue に貼らない
-- 既存のデザイントークン（CSS変数 / `tailwind.config` / `globals.css`）に合わせて色・角丸・
-  タイポを**必ず上書き調整**する。素のまま貼るとテンプレート臭が出る
-- 適用後の検証: `webapp-testing` スキルまたは `/run` で実際に起動してスクリーンショットを撮り、
-  ユーザーに見せる
 
 ## Step 5 — 出典とライセンスの記録
 
