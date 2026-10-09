@@ -5,7 +5,10 @@
 
 ## shadcn/ui MCP
 
-- **接続状態**: user スコープに登録済み（`npx shadcn@latest mcp`）
+- **接続状態**: user スコープに登録済み。起動コマンドは CLI の版を固定した
+  `npx shadcn@<版> mcp` にする（版は `npm view shadcn version` で調べる）。
+  `@latest` で登録されている場合は、固定した版で登録し直す。版を上げるときは、変更点を確認してから
+  登録を更新する
 - **起動コマンドまたはツール名**: ツール7個
   - `get_project_registries`
   - `list_items_in_registries`
@@ -32,6 +35,10 @@
 
   # ファイル単体の取得。--jq .content は base64 のまま返るので raw ヘッダを使う
   gh api repos/OWNER/REPO/contents/PATH -H "Accept: application/vnd.github.raw"
+
+  # 取り込むファイルは SHA で固定する。ref を省くと既定ブランチの最新が返る
+  gh api repos/OWNER/REPO/commits/BRANCH --jq .sha
+  gh api "repos/OWNER/REPO/contents/PATH?ref=<SHA>" -H "Accept: application/vnd.github.raw"
   ```
 - **料金と制限**: 無料
 - **向いている用途**: OSSテンプレート/実装例の探索、LICENSE確認、star数・最終更新日の確認。
@@ -80,8 +87,16 @@
   - `get_theme` のテーマCSSは無料
   - 有料プラン: https://21st.dev/pricing
 - **配布形態**: shadcn レジストリ。`search` 結果の `installCommand` は
-  `npx shadcn@latest add "https://21st.dev/r/AUTHOR/NAME?api_key=$API_KEY_21ST"` の形。
-  このコマンドをそのまま叩くなら環境変数 `API_KEY_21ST` が別途必要（MCP経由の取得には不要）
+  `https://21st.dev/r/AUTHOR/NAME?api_key=$API_KEY_21ST` を `shadcn add` に渡す形で、
+  CLI の版が `@latest` になっている。**このコマンドは実行しない。** CLI の版を `npx shadcn@<版>` に
+  固定し、JSON をファイルに保存して `dependencies`・`files`・`registryDependencies` を確認し、
+  確認したそのファイルから取り込む。取り込み後は `git diff` とロックファイルの差分を見る
+  （手順とコマンド例は SKILL.md Step 4「取り込み前後の確認」）。JSON の取得には環境変数
+  `API_KEY_21ST` が別途必要（MCP経由の取得には不要）
+- **APIキーの扱い**: URL のクエリにキーが入るので、キーの値をコマンドライン・ログ・
+  ドキュメントに出さない。JSON の確認用取得は `--data-urlencode "api_key@-"` で標準入力から
+  キーを渡し、`curl -v` は使わない。キー入りの URL を `shadcn add` に渡すと、展開されたキーが
+  プロセスの引数に入るので使わない。出典の記録には `?api_key=...` を除いた URL を書く
 - **向いている用途**: **ルート2（表現駆動）の探索**。検索が無料無制限なので、
   意匠のカタログを広く見るのに最適。候補を絞り切ってから `get_component` を呼ぶ
 - **向いていない用途**: 1日3件以上のコード取得。書き込み系ツール
