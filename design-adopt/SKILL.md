@@ -81,7 +81,14 @@ Figma MCP・21st.dev Magic MCP・Lovable MCP といった情報源をコスト�
 
 **必ず `get_project_registries` から始める。** 対象プロジェクトに `components.json` が無い、
 またはレジストリが未設定だと後続のツールが失敗する。未設定なら先に
-`npx shadcn@latest init` を実行するかどうかをユーザーに確認すること。
+`npx shadcn@<版> init` を実行するかどうかをユーザーに確認すること。
+
+**CLI は `@latest` で実行しない。** 導入時点の版を `npm view shadcn version` で調べ、
+`npx shadcn@<版>` の形で固定する（CLI 自体も依存パッケージであり、実行のたびに最新版を
+取りに行かせない）。`get_add_command_for_items` や 21st.dev の `installCommand` が
+`@latest` 付きのコマンドを返しても、固定した版に書き換えてから実行する。
+この方針と後述の取り込み前後の確認は、`webapp-blueprint/references/component-registry.md` の
+「導入の手順」に揃えている。
 
 ### 21st.dev の注意書き
 
@@ -93,8 +100,13 @@ Figma MCP・21st.dev Magic MCP・Lovable MCP といった情報源をコスト�
   候補を3つに絞り込んでから呼ぶこと。残量は `get_usage` で確認できる
 - `get_theme` が返すテーマCSSは無料。ただしカタログは薄い（実測: 「dark theme」で1件）
 - **配布形態は shadcn レジストリ**。`search` の結果に含まれる `installCommand` は
-  `npx shadcn@latest add "https://21st.dev/r/AUTHOR/NAME?api_key=$API_KEY_21ST"` の形なので、
-  このコマンドをそのまま実行するなら環境変数 `API_KEY_21ST` の設定が必要
+  `https://21st.dev/r/AUTHOR/NAME?api_key=$API_KEY_21ST` を `shadcn add` に渡す形で、
+  CLI の版が `@latest` になっている。**そのまま実行せず**、版を固定し、Step 4 の
+  「取り込み前後の確認」を通してから取り込む。CLI で取り込む場合は環境変数 `API_KEY_21ST` が
+  必要で、キーの設定はユーザーに依頼する
+- **URL にAPIキーが入る**ので、キーの値をコマンドライン・ログ・ドキュメントに出さない。
+  コマンドには必ず `$API_KEY_21ST` のまま書き、`docs/design-sources.md` などに出典を記録するときは
+  `?api_key=...` を除いた `https://21st.dev/r/AUTHOR/NAME` だけを書く
 - 書き込み系（`submit_component` `edit_profile` `delete_*` など）は**ユーザーに明示的に
   頼まれない限り呼ばない**
 
@@ -148,10 +160,49 @@ star数だけで選ばないこと。
 
 ## Step 4 — 適用
 
-- 系統Aの場合: `get_add_command_for_items` で得たコマンドをそのまま実行し、最後に
-  `get_audit_checklist` を必ず走らせる
-- GitHub由来のコードをコピーする場合: **ライセンス表記を保持**し、ファイル冒頭に出典URLを
-  コメントで残す
+- 系統Aの場合: `get_add_command_for_items` で得たコマンドを、CLI の版を `npx shadcn@<版>` に
+  書き換えたうえで、下の「取り込み前後の確認」に沿って実行する。最後に `get_audit_checklist` を
+  必ず走らせる
+- GitHub由来のコードを取り込む場合: ブランチ名ではなく**コミット SHA で固定**した URL
+  （`gh api repos/OWNER/REPO/commits/BRANCH --jq .sha` で調べる）から取得する。
+  **ライセンス表記を保持**し、ファイル冒頭に出典URL（SHA入り）をコメントで残す
+
+### 取り込み前後の確認（shadcn 互換レジストリ全般）
+
+レジストリから取り込むと、ソースがプロジェクトに書き込まれ、項目に書かれた npm パッケージも
+インストールされる。shadcn/ui・21st.dev・GitHub 上のレジストリのいずれでも、次の順で進める。
+
+1. **版を固定する。** `npm view shadcn version` で CLI の版を調べ、`npx shadcn@<版>` で実行する。
+   Git 上のレジストリ JSON を使うときは、URL のブランチ名部分をコミット SHA に置き換える
+2. **取り込む前に JSON を読む。** レジストリ項目の JSON を取得して、次を確かめる
+   - `dependencies` / `devDependencies`: 増える npm パッケージが妥当か。版指定がなければ
+     実行時点の最新版が入る点に注意する（依存の審査は `webapp-blueprint/references/tech-stack.md`）
+   - `files`: ソースに外部への通信・`eval`・`dangerouslySetInnerHTML` など、用途から見て
+     不要な処理がないか
+   - `registryDependencies`: さらに別の URL から取り込む項目がないか。あれば、その項目にも
+     同じ確認をする
+3. **取り込んで差分を見る。** 作業ブランチで add を実行し、`git diff` と
+   ロックファイル（`package-lock.json` / `pnpm-lock.yaml` など）の差分をすべて確認してから
+   コミットする
+4. **記録する。** Step 5 の項目に、SHA（Git から取り込んだ場合）・CLI の版・取得日を加える
+
+shadcn/ui 公式や Git 上の JSON は、`curl -s <URL>` でそのまま取得してよい。
+
+21st.dev の JSON は URL に APIキーが入るため、キーをコマンドライン引数・シェル履歴・ログに
+出さない形で取得する。`--data-urlencode "api_key@-"` は値を標準入力から読むので、
+キーがプロセスの引数にも現れない。取得結果はファイルに保存して読む。
+
+```bash
+printf '%s' "$API_KEY_21ST" | curl -sfG "https://21st.dev/r/AUTHOR/NAME" --data-urlencode "api_key@-" -o /tmp/21st-NAME.json
+```
+
+- `curl -v` や `set -x` は URL（キー入り）を出力するので使わない
+- 読んで問題がなければ、確認したそのファイルを `npx shadcn@<版> add /tmp/21st-NAME.json` で
+  取り込むと、確認した内容と取り込む内容が一致する。CLI の版がローカルファイルを受け付けない
+  場合は、`npx shadcn@<版> add "https://21st.dev/r/AUTHOR/NAME?api_key=$API_KEY_21ST"` の形で
+  実行する（キーは環境変数のまま渡し、値を直接書かない）
+- CLI のエラー出力に URL が含まれることがあるので、出力をそのままドキュメントや
+  Issue に貼らない
 - 既存のデザイントークン（CSS変数 / `tailwind.config` / `globals.css`）に合わせて色・角丸・
   タイポを**必ず上書き調整**する。素のまま貼るとテンプレート臭が出る
 - 適用後の検証: `webapp-testing` スキルまたは `/run` で実際に起動してスクリーンショットを撮り、
@@ -161,8 +212,10 @@ star数だけで選ばないこと。
 
 対象プロジェクト直下に `docs/design-sources.md` を作成/追記する。記録する項目:
 
-- 日付
-- 採用元（URL）
+- 日付（取得日）
+- 採用元（URL。Git 由来ならコミット SHA 入り。21st.dev は `?api_key=...` を除いた URL）
+- コミット SHA（Git から取り込んだ場合は必須）
+- 取り込みに使った CLI の版（`shadcn@<版>`）
 - ライセンス
 - 取り込んだファイル
 - 変更点

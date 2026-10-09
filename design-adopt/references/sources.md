@@ -5,7 +5,10 @@
 
 ## shadcn/ui MCP
 
-- **接続状態**: user スコープに登録済み（`npx shadcn@latest mcp`）
+- **接続状態**: user スコープに登録済み。起動コマンドは CLI の版を固定した
+  `npx shadcn@<版> mcp` にする（版は `npm view shadcn version` で調べる）。
+  `@latest` で登録されている場合は、固定した版で登録し直す。版を上げるときは、変更点を確認してから
+  登録を更新する
 - **起動コマンドまたはツール名**: ツール7個
   - `get_project_registries`
   - `list_items_in_registries`
@@ -80,8 +83,15 @@
   - `get_theme` のテーマCSSは無料
   - 有料プラン: https://21st.dev/pricing
 - **配布形態**: shadcn レジストリ。`search` 結果の `installCommand` は
-  `npx shadcn@latest add "https://21st.dev/r/AUTHOR/NAME?api_key=$API_KEY_21ST"` の形。
-  このコマンドをそのまま叩くなら環境変数 `API_KEY_21ST` が別途必要（MCP経由の取得には不要）
+  `https://21st.dev/r/AUTHOR/NAME?api_key=$API_KEY_21ST` を `shadcn add` に渡す形で、
+  CLI の版が `@latest` になっている。**そのままは実行しない。** CLI の版を `npx shadcn@<版>` に
+  固定し、JSON を取得して `dependencies`・`files`・`registryDependencies` を確認してから
+  取り込み、取り込み後に `git diff` とロックファイルの差分を見る（手順とコマンド例は
+  SKILL.md Step 4「取り込み前後の確認」）。CLI で取り込むには環境変数 `API_KEY_21ST` が
+  別途必要（MCP経由の取得には不要）
+- **APIキーの扱い**: URL のクエリにキーが入るので、キーの値をコマンドライン・ログ・
+  ドキュメントに出さない。JSON の確認用取得は `--data-urlencode "api_key@-"` で標準入力から
+  キーを渡し、`curl -v` は使わない。出典の記録には `?api_key=...` を除いた URL を書く
 - **向いている用途**: **ルート2（表現駆動）の探索**。検索が無料無制限なので、
   意匠のカタログを広く見るのに最適。候補を絞り切ってから `get_component` を呼ぶ
 - **向いていない用途**: 1日3件以上のコード取得。書き込み系ツール
