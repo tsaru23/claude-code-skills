@@ -1,4 +1,4 @@
-# 品質基準（パフォーマンス・アクセシビリティ・SEO・テスト）
+# 品質基準（パフォーマンス・アクセシビリティ・SEO・テスト・セキュリティ検査）
 
 Webアプリケーションの設計書に品質基準を転記するための参照資料である。散文の解説より
 チェック可能な項目表を主体とする。数値目標のうち公式に定義されているものは断定し、
@@ -213,14 +213,114 @@ WCAG 2.2のAAレベルを基準とする。
 - 0→1フェーズでUIが頻繁に変わる間は、差分確認の運用コストがメリットを上回りやすいため、
   UIがある程度安定してからの導入を検討する。
 
+## セキュリティ検査
+
+`references/security-baseline.md` の「脆弱性ゼロ」の定義（High 以上の未対応の指摘0件・
+放置ゼロ・根拠のない ✅ ゼロ）を、ツールで判定するための検査である。人が読んで確かめる
+項目と違い、毎回同じ基準で失敗させられるため、CI に組み込んで常に実行する。
+
+| 検査 | 見つけるもの | ツール例 | 失敗させる条件 | 実行タイミング | 適用レベル |
+|---|---|---|---|---|---|
+| 依存の脆弱性監査 | 既知の脆弱性を持つ依存パッケージ | `npm audit --audit-level=high`、`pnpm audit --audit-level high`、Dependabot alerts | High 以上が1件でもある | PR ごと＋定期（週1回以上） | L1必須／L2必須／L3必須 |
+| シークレット検出 | コミット履歴・ビルド成果物に混入した API キー・秘密鍵 | gitleaks（`gitleaks git` で履歴、`gitleaks dir` でビルド成果物）、GitHub の secret scanning と push protection | 1件でもある | コミット前（コミット前フックまたは push protection）と PR ごとの両方。CI で見つかった時点ではすでに漏洩しているため、コミット前の検査を省略しない | L1必須／L2必須／L3必須 |
+| 静的解析（SAST） | インジェクション・XSS・安全でない乱数など、コード上の脆弱なパターン | CodeQL（GitHub の code scanning）、Semgrep | High 以上が1件でもある（CodeQL は保護ルールの失敗しきい値を「High or higher」にする） | PR ごと | L1推奨／L2必須／L3必須 |
+| CI 設定の検査 | 版を固定していないアクション、広すぎる権限、`pull_request_target` の危険な使い方 | actionlint、zizmor | 指摘が1件でもある | ワークフローを変更した PR | L1推奨／L2必須／L3必須 |
+| 動的検査（DAST） | 実際の応答に現れる問題（ヘッダの欠落、Cookie 属性、エラー時の情報露出等） | OWASP ZAP baseline scan（攻撃を伴わない受動的な検査） | FAIL に分類した警告が1件でもある | プレビュー環境またはステージングに対して、リリース前 | L1推奨／L2必須／L3必須 |
+| 本番の応答確認 | 設定したつもりのヘッダ・リダイレクト・非公開ファイルが本番で効いているか | `curl`（下記のコマンド） | 期待した応答と1つでも違う | デプロイ後に毎回 | L1必須／L2必須／L3必須 |
+| 認可の自動テスト | 他人のリソースを読み書きできてしまう不備 | 単体・統合テスト（利用者 A のトークンで利用者 B のリソースを操作する） | 拒否されないリクエストが1件でもある | PR ごと | L1必須（DB を使う場合）／L2必須／L3必須 |
+
+- ZAP の full scan（攻撃を伴う検査）は、自分が管理するステージング環境に限って実行する。
+  本番や他者のサービスに対して実行しない。
+- 誤検知で検査を止めたい場合は、検査を外すのではなく、該当の指摘を「受容」として
+  理由・見直し期限とともに記録し、ツールの除外設定にも同じ理由を書く。
+- 有償プランが必要なツール・機能（非公開リポジトリでの CodeQL 等）がある。使えない場合は
+  Semgrep 等の代替を選び、選んだ理由を設計書に残す。
+
+**CI ワークフローのイメージ**（GitHub Actions 相当の擬似形式。`<SHA>` は各アクションの
+リリースのコミット SHA に置き換え、版をコメントで残す）:
+
+```yaml
+name: security
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 3 * * 1" # 公開後に見つかった新しい脆弱性を拾うため週1回
+permissions:
+  contents: read # 既定は読み取りのみにし、必要なジョブだけ広げる
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@<SHA> # v4.x.x
+        with:
+          fetch-depth: 0 # シークレット検出で履歴全体を見るため
+      - uses: actions/setup-node@<SHA> # v4.x.x
+        with:
+          node-version-file: .nvmrc
+      - run: npm ci --ignore-scripts # 依存のインストール時スクリプトを一律には実行しない
+      # インストール時の処理（コード生成・ネイティブモジュールのビルド等）が必要な依存は、
+      # 審査したものだけ名前を指定して実行する。不要なら、この行は削除する
+      # （.npmrc に ignore-scripts=true がある場合も実行されるよう、明示的に false を渡す）
+      - run: npm rebuild <審査済みのパッケージ名> --ignore-scripts=false
+      - run: npm audit --audit-level=high
+      - run: npm run build
+      # gitleaks は実行環境に入っていないため、版とチェックサムを固定して取得する
+      # （チェックサムはリリースページの checksums.txt にある linux_x64 の値）
+      - name: install gitleaks
+        env:
+          GITLEAKS_VERSION: "<版。例 8.28.0>"
+          GITLEAKS_SHA256: "<64桁のチェックサム>"
+        run: |
+          curl -sSfLo gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo install gitleaks /usr/local/bin/gitleaks
+      - run: gitleaks git --redact
+      - run: gitleaks dir --redact ./dist # ビルド成果物（出力先はフレームワークに合わせる）
+```
+
+**本番の応答を確かめるコマンド**（`https://example.com` は本番 URL に置き換える）:
+
+```bash
+# セキュリティヘッダ: 必要なヘッダを1つずつ確かめ、1つでも欠けていれば失敗する。
+# クリックジャッキング対策は、CSP の frame-ancestors か X-Frame-Options のどちらかがあればよい
+headers=$(curl -sI https://example.com/)
+missing=0
+for h in content-security-policy strict-transport-security x-content-type-options referrer-policy permissions-policy; do
+  printf '%s\n' "$headers" | grep -qi "^$h:" || { echo "MISSING: $h"; missing=1; }
+done
+printf '%s\n' "$headers" | grep -i '^content-security-policy:' | grep -qi 'frame-ancestors' \
+  || printf '%s\n' "$headers" | grep -qi '^x-frame-options:' \
+  || { echo "MISSING: frame-ancestors / x-frame-options"; missing=1; }
+test "$missing" -eq 0 && echo "all security headers present"
+
+# HTTP から HTTPS へのリダイレクト: 301 または 308 で https:// へ飛ぶこと
+curl -sI http://example.com/ | grep -iE '^(HTTP/|location:)'
+
+# 非公開であるべきファイル: すべて 404（または 403）であること
+for p in /.env /.git/config /.git/HEAD /package.json; do
+  printf '%s %s\n' "$(curl -so /dev/null -w '%{http_code}' "https://example.com$p")" "$p"
+done
+
+# 脆弱性の報告窓口: Contact と Expires が含まれ、Expires が未来の日付であること
+curl -s https://example.com/.well-known/security.txt
+
+# セッション Cookie の属性: HttpOnly・Secure・SameSite が付いていること（ログイン応答に対して実行）
+curl -sI -X POST https://example.com/api/login | grep -i '^set-cookie:'
+```
+
 ## CI/CDの品質ゲート
 
 **PRで必ず走らせるもの**
 
 - [ ] 型チェック
 - [ ] Lint
-- [ ] 単体テスト・統合テスト
+- [ ] 単体テスト・統合テスト（認可の自動テストを含む）
 - [ ] ビルド（本番相当の設定でビルドが通ることの確認）
+- [ ] 依存の脆弱性監査とシークレット検出（「セキュリティ検査」の節。L1 から必須）
+- [ ] 静的解析（SAST）（L2 以上で必須）
 
 **任意にできるもの（プロジェクトの規模・体制に応じて判断）**
 
@@ -240,7 +340,10 @@ WCAG 2.2のAAレベルを基準とする。
 削除する場合は理由を設計書に明記する。
 
 - [ ] `references/security-baseline.md`のリリース前セキュリティチェックリスト（該当レベル分）を満たしている
-- [ ] PRの品質ゲート（型チェック・Lint・テスト・ビルド）がすべて通過している
+- [ ] 「脆弱性ゼロ」の3条件を満たしている（依存監査・シークレット検出・SAST（L2 以上、L1 は実施する場合）で High 以上の未対応0件、
+      未分類の指摘なし、セキュリティ項目の ✅ すべてに根拠あり）
+- [ ] 本番の応答確認（セキュリティヘッダ・HTTPS へのリダイレクト・非公開ファイル）が期待どおりである
+- [ ] PRの品質ゲート（型チェック・Lint・テスト・ビルド・セキュリティ検査）がすべて通過している
 - [ ] Core Web Vitalsが目標範囲内、または乖離の理由と対応方針が設計書に明記されている
 - [ ] アクセシビリティの自動チェックが通過し、手動確認項目（キーボード操作・スクリーン
       リーダー等）を実施済みである
