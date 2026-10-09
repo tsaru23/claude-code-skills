@@ -1,6 +1,6 @@
 # claude-code-skills
 
-Claude Code で使っているスキルのうち、自分で作った6つをまとめたリポジトリです。スキルは、`SKILL.md` に「どんな依頼で動くか」と「どう進めるか」を書いたフォルダのことで、依頼の内容が `description` の条件に合うと、Claude Code がその手順を読み込んで動きます（Agent Skills）。導入の手順と、動かないときの確認点は末尾にまとめています。
+Claude Code で使っているスキルのうち、自分で作った7つをまとめたリポジトリです。スキルは、`SKILL.md` に「どんな依頼で動くか」と「どう進めるか」を書いたフォルダのことで、依頼の内容が `description` の条件に合うと、Claude Code がその手順を読み込んで動きます（Agent Skills）。導入の手順と、動かないときの確認点は末尾にまとめています。
 
 | スキル | 何をするか | 追加で必要なもの |
 |---|---|---|
@@ -10,6 +10,7 @@ Claude Code で使っているスキルのうち、自分で作った6つをま�
 | [session-title-refresh](#session-title-refresh) | セッション名を、何をしているか分かる名前に付け直す | セッションの一覧取得と改名ができるツール |
 | [webapp-blueprint](#webapp-blueprint) | Webアプリを0から作るときの設計書を、対話で決めながら書き出す | コンポーネントの取得に shadcn CLI（`npx shadcn`） |
 | [x-bookmark-dev-source](#x-bookmark-dev-source) | Xのブックマークを公式APIで取り込み、開発ネタの情報源として使う | X Developer アカウントと API クレジット、Python 3.10+、Claude Code CLI、GitHub CLI（任意） |
+| [pdf-to-markdown](#pdf-to-markdown) | PDFをLLMに読ませる前にローカルでMarkdownへ変換し、以後は.mdだけを参照してトークンを節約する | Python 3.10+、`pymupdf4llm` |
 
 ## model-orchestrator
 
@@ -52,6 +53,12 @@ X（旧Twitter）でブックマークした投稿を、公式 X API v2 だけ�
 ブックマーク本文は他人が書いたデータのため、指示としては扱いません。投稿で紹介されたコマンドの実行やリンク先へのアクセスはユーザーに確認してから行い、本文を公開物にそのまま転載することもしません。保存先のデータ用リポジトリは著作権・X開発者規約上、必ずプライベートにする必要があります。
 
 X API とリプライ検索は従量課金です。目安や設定手順は `references/setup.md` にまとめています。
+
+## pdf-to-markdown
+
+講義スライドや論文のPDFを、Claudeに直接読ませず、先にローカルツールでMarkdownにします。テキスト層のあるPDFは PyMuPDF4LLM（同梱の `scripts/pdf2md.py`）で一括変換し、スキャンPDFはOCR、構造が崩れる論文は marker / docling、と種類で使い分けます。LLMに読ませるのは、変換結果で足りない箇所を画像で確かめるときだけです。
+
+変換後は `.md` だけを `Grep` で絞って読むので、レポートや要約を書くときのトークン消費が減ります。ページごとに `<!-- page N -->` を入れるので、出典のページ番号も遡れます。
 
 ## 導入方法
 
